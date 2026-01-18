@@ -1,0 +1,663 @@
+---
+title: "Anlysis of empirical victim-exploiter bipartite networks"
+---
+
+
+This script reads a collection of empirical victim-exploiter bipartite networks, removes isolated species, and computes a set of structural metrics at both the network and species levels. The dataset of empirical networks metrics it produces is then used in **2_simulation_empirical_networks.Rmd** and in **3_metrics_simulated_networks.Rmd**.
+
+For each network, it quantifies species richness, connectance, modularity, nestedness (NODF), degree distributions, complexity indices, and matrix entropy (not included in the article), alongside species-level degree and betweenness centrality. 
+
+It then computes total indirect interaction effects from the bipartite adjacency matrix, decomposing these effects into incoming (INN) and outgoing (OUT) components, and summarizes their magnitude, variability, and evenness using (normalized and non-normalized) Shannon entropy. 
+
+All metrics are stored in a unified data frame and saved, and visualized through a series of exploratory plots.
+
+
+```{r}
+library(poweRlaw)
+library(bipartite)
+library(vegan)
+library(igraph)
+library(tidyverse)
+library(ggplot2)
+library(reshape2)
+library(tidyr)
+library(dplyr)
+library(ggpubr)
+library(viridis)
+library(grid)
+library(bipartite) # to use the networklevel() function to calculate modularity and nestedness
+
+source(here::here("code/functions/Functions.R"))
+source(here::here("code/functions/compute_net_effects.R"))
+source(here::here("code/functions/compute_metrics_networks.R"))
+
+
+```
+
+
+For plotting:
+
+```{r}
+my_theme<-theme_classic()+theme(axis.text=element_text(size=12),
+        axis.title = element_text(size = 14),
+        legend.text=element_text(size=10),
+        legend.title = element_text(size=12),
+        plot.title = element_text(face="bold",size=14,margin=margin(0,0,20,0),hjust = 0.5),
+        axis.title.y = element_text(margin = margin(t = 0, r = 15, b = 0, l = 0)),
+        axis.title.x = element_text(margin = margin(t = 15, r = 0, b = 0, l = 0)))
+
+```
+
+
+
+### Read and process empirical networks
+
+```{r}
+
+# Path to empirical network files
+
+path <-"../data/empirical_networks"
+files_path <- list.files(path = path, pattern = ".txt", full.names = TRUE)
+
+
+# read metadata
+
+table_networks<-read.csv("../data/empirical_networks/antagonistic_networks.csv", sep=",", header = TRUE)
+
+# optain list of names
+
+names_networks<- unname(sapply(table_networks[, "network.file"], paste, ".txt", sep=""))
+
+
+# create list of network .csv files
+
+list_networks <- list()
+
+for (i in 1:length(files_path)) {
+
+  
+  list_networks[[i]] <-read.csv(files_path[i], sep="", header = FALSE)
+  
+}
+
+
+# check we read them all
+
+if(length(list_networks) == length(files_path)){
+  
+  print("all good")
+}else{
+  print("problem")
+}
+
+
+# add list of network .csv files to the metadata table
+
+table_networks$list_networks <- list_networks
+table_networks$names_network_files <-names_networks
+
+table_networks <- table_networks %>% 
+    rename("nvictim" = "nvitim",
+           "connect" = "connectance") %>% 
+  select(-nvictim, 
+         -nexpl,
+         -connect)
+
+head(table_networks)
+
+```
+
+
+Remove isolated species
+
+```{r}
+
+table_networks$list_networks <- lapply(table_networks$list_networks, remove_isolated_species)
+
+```
+
+
+
+## Compute Network metrics
+
+```{r}
+
+# function to compute connectance
+
+compute_connectance <- function(g) {
+  # Ensure the graph is bipartite
+  if (!is_bipartite(g)) {
+    stop("The graph is not bipartite. Ensure 'type' attribute is correctly set.")
+  }
+  
+  # Extract node types
+  type <- V(g)$type
+  
+  # Number of species at each level
+  T <- sum(type)       # Number of nodes in the top level (TRUE in 'type')
+  B <- sum(!type)      # Number of nodes in the bottom level (FALSE in 'type')
+  
+  # Number of observed edges (L)
+  L <- ecount(g)       # Total number of edges in the bipartite graph
+  
+  # Maximum possible interactions (m)
+  m <- T * B           # Product of species in the two levels
+  
+  print(paste("T =", T, "B =", B, "L =", L, "m =", m))
+  if (m == 0 || is.na(m)) {
+    stop("Invalid maximum possible interactions (m).")
+  }
+  
+  # Connectance formula
+  connectance <- L / m
+  return(connectance)
+}
+
+compute_modularity <- function(g) {
+  # Compute modularity using different methods
+  mod_louvain <- cluster_louvain(g)$modularity
+  mod_walktrap <- modularity(cluster_walktrap(g))
+  mod_fast_greedy <- modularity(cluster_fast_greedy(g))
+  mod_leading_eigen <- cluster_leading_eigen(g)$modularity
+  
+  # Compute the mean modularity
+  mean_modularity <- mean(c(mod_louvain, mod_walktrap, mod_fast_greedy, mod_leading_eigen), na.rm = TRUE)
+  
+  return(mean_modularity)
+}
+```
+
+
+SD entropy computed as:
+
+
+$$ J = - \frac{1}{ln(k)} * \sum_{i = 1}^{k} s_i * ln(s_i)  $$
+
+
+```{r}
+
+# network level
+
+table_networks$nvictim <- vector("numeric", length = nrow(table_networks))
+table_networks$nexpl <- vector("numeric", length = nrow(table_networks))
+table_networks$nspp <- vector("numeric", length = nrow(table_networks))
+table_networks$connectance <- vector("numeric", length = nrow(table_networks))
+table_networks$modularity <- vector("numeric", length = nrow(table_networks))
+table_networks$NODF <- vector("numeric", length = nrow(table_networks))
+table_networks$alpha <- vector("numeric", length = nrow(table_networks))
+table_networks$complexity_index <- numeric(length(table_networks$list_networks))
+table_networks$entropy <- numeric(length(table_networks$list_networks))
+
+
+# spp level
+
+table_networks$betw <- vector("list", nrow(table_networks))
+table_networks$betw_v <- vector("list", nrow(table_networks))
+table_networks$betw_e <- vector("list", nrow(table_networks))
+table_networks$degree <- vector("list", nrow(table_networks))
+table_networks$degree_v <- vector("list", nrow(table_networks))
+table_networks$degree_e <- vector("list", nrow(table_networks))
+
+# Loop through each network in the list
+
+counter <- 0
+
+for (i in 1:length(table_networks$list_networks)) {
+  
+  counter <- counter + 1  
+  
+  # Read data
+  network <- table_networks$list_networks[[i]]
+  
+  # Convert matrix to igraph object
+  g <- graph_from_biadjacency_matrix(network)
+  
+  # Compute metrics
+  table_networks$nvictim[i] <- nrow(network)
+  table_networks$nexpl[i] <- ncol(network)
+  table_networks$nspp[i] <- sum(dim(network))
+  table_networks$connectance[i] <- unname(compute_connectance(g))
+  table_networks$modularity[i] <- unname(compute_modularity(g))
+  table_networks$NODF[i] <- unname(nestednodf(network)$statistic["NODF"])
+  graph <- igraph::graph_from_incidence_matrix(network)
+  degrees <- igraph::degree(graph)
+  table_networks$alpha[i] <- compute_alpha_pl(degrees)
+  table_networks$complexity_index[i] <- sqrt(unname(networklevel(network, index = "connectance")) * sum(dim(network)))
+  table_networks$entropy[i] <- compute_SVD_entropy(network)
+  
+  table_networks$betw[[i]] <- compute_centrality(binmatrix = unname(as.matrix(table_networks$list_networks[[i]])),
+                                                 n_v = nrow(network), n_e = ncol(network))$betw
+  
+  table_networks$betw_v[[i]] <- compute_centrality(binmatrix = unname(as.matrix(table_networks$list_networks[[i]])),
+                                                   n_v = nrow(network), n_e = ncol(network))$betw_v
+  
+  table_networks$betw_e[[i]] <- compute_centrality(binmatrix = unname(as.matrix(table_networks$list_networks[[i]])),
+                                                   n_v = nrow(network), n_e = ncol(network))$betw_e
+  
+  table_networks$degree[[i]] <- compute_centrality(binmatrix = unname(as.matrix(table_networks$list_networks[[i]])),
+                                                   n_v = nrow(network), n_e = ncol(network))$degree
+  
+  table_networks$degree_v[[i]] <- compute_centrality(binmatrix = unname(as.matrix(table_networks$list_networks[[i]])),
+                                                     n_v = nrow(network), n_e = ncol(network))$degree_v
+  
+  table_networks$degree_e[[i]] <- compute_centrality(binmatrix = unname(as.matrix(table_networks$list_networks[[i]])),
+                                                     n_v = nrow(network), n_e = ncol(network))$degree_e
+  
+  
+  # Print progress
+  cat("Iteration ", counter, "/", length(table_networks$list_networks), "\n")
+}
+
+head(table_networks)
+
+```
+
+
+
+
+```{r}
+# Names to exclude
+exclude_files <- c("lebsko_complex.txt", "wichels.txt")
+
+# Filter out rows with these names
+table_networks <- table_networks %>%
+  filter(!names_network_files %in% exclude_files)
+```
+
+
+## Compute net effects
+
+nf1 = INN effects
+
+nf2 = OUT effects
+
+```{r}
+
+
+# community-level
+table_networks$T_matrix <- vector(mode = "list", length = nrow(table_networks))
+table_networks$T_mean <- numeric(nrow(table_networks))
+table_networks$T_sd <- numeric(nrow(table_networks))
+
+
+# cummulative effects
+
+### nf1
+
+table_networks$T_nf1_s_vec <- vector(mode = "list", length = nrow(table_networks))
+table_networks$T_nf1_sum_vec <- vector(mode = "list", length = nrow(table_networks))
+table_networks$T_nf1_mean_vec <- vector(mode = "list", length = nrow(table_networks))
+table_networks$T_nonorm_nf1_s_vec <- vector(mode = "list", length = nrow(table_networks))
+
+table_networks$T_nf1_sum <- numeric(nrow(table_networks))
+table_networks$T_nf1_mean <- numeric(nrow(table_networks))
+table_networks$T_nf1_sd <- numeric(nrow(table_networks))
+table_networks$T_nf1_s <- numeric(nrow(table_networks)) # shannon index
+table_networks$T_nonorm_nf1_s <- numeric(nrow(table_networks))
+
+
+
+### nf2
+
+table_networks$T_nf2_s_vec <- vector(mode = "list", length = nrow(table_networks))
+table_networks$T_nf2_sum_vec <- vector(mode = "list", length = nrow(table_networks))
+table_networks$T_nf2_mean_vec <- vector(mode = "list", length = nrow(table_networks))
+table_networks$T_nonorm_nf2_s_vec <- vector(mode = "list", length = nrow(table_networks))
+
+
+table_networks$T_nf2_sum <- numeric(nrow(table_networks))
+table_networks$T_nf2_mean <- numeric(nrow(table_networks))
+table_networks$T_nf2_sd <- numeric(nrow(table_networks))
+table_networks$T_nf2_s <- numeric(nrow(table_networks)) # shannon index
+table_networks$T_nonorm_nf2_s <- numeric(nrow(table_networks))
+
+
+
+
+for (i in 1:nrow(table_networks)) {
+  mat <- unname(as.matrix(table_networks$list_networks[[i]]))
+  
+  # Calculate total effects matrix
+  T <- compute_total_effects(mat)
+  
+  # Store total effects matrix
+  table_networks$T_matrix[[i]] <- T
+  
+  # Compute mean and standard deviation of total effects matrix
+  table_networks$T_mean[i] <- mean(T)
+  table_networks$T_sd[i] <- sd(T)
+  
+  # Compute cummulative effects 
+  
+  table_networks$T_nf1_sum_vec[[i]] <- rowSums(T)
+  table_networks$T_nf2_sum_vec[[i]] <- colSums(T)
+  
+  table_networks$T_nf1_sum[i] <- mean(rowSums(T))
+  table_networks$T_nf2_sum[i] <- mean(colSums(T))
+  
+  
+  table_networks$T_nf1_mean_vec[[i]] <- rowMeans(T)
+  table_networks$T_nf2_mean_vec[[i]] <- colMeans(T)
+  
+  table_networks$T_nf1_mean[i] <- mean(rowMeans(T))
+  table_networks$T_nf2_mean[i] <- mean(colMeans(T))
+  
+  table_networks$T_nf1_sd[i] <- sd(rowMeans(T))
+  table_networks$T_nf2_sd[i] <- sd(colMeans(T))
+  
+  
+  # Compute shannon index
+  
+  T_nf1_s_vec <- apply(T, 1, compute_shannon)
+  T_nf2_s_vec <- apply(T, 2, compute_shannon)
+  T_nonorm_nf1_s_vec <- apply(T, 1, compute_shannon_nonorm)
+  T_nonorm_nf2_s_vec <- apply(T, 2, compute_shannon_nonorm)
+  
+  # Store shannon index nf1 and nf2 vectors
+  table_networks$T_nf1_s_vec[[i]] <- T_nf1_s_vec
+  table_networks$T_nf2_s_vec[[i]] <- T_nf2_s_vec
+  table_networks$T_nonorm_nf1_s_vec[[i]] <- T_nonorm_nf1_s_vec
+  table_networks$T_nonorm_nf2_s_vec[[i]] <- T_nonorm_nf2_s_vec
+  
+  
+  
+  table_networks$T_nf1_s[i] <- mean(T_nf1_s_vec)
+  table_networks$T_nf2_s[i] <- mean(T_nf2_s_vec)
+  table_networks$T_nonorm_nf1_s[i] <- mean(T_nonorm_nf1_s_vec)
+  table_networks$T_nonorm_nf2_s[i] <- mean(T_nonorm_nf2_s_vec)
+  
+}
+
+
+head(table_networks)
+```
+
+Save table
+
+```{r}
+saveRDS(table_networks, here::here("output/df_network_metrics.rds"))
+```
+
+
+## Plot metrics
+
+
+```{r}
+
+# Plot modularity against nestedness
+plot_mod_nest <- ggplot(table_networks, aes(x = modularity, y = NODF)) +
+  geom_point(alpha = 0.3, size = 2) +
+  labs(x = "Modularity", y =expression(paste("Nestedness ",italic((NODF))))) +
+  my_theme
+
+# Plot connectance against NSPP
+plot_conn_nspp <- ggplot(table_networks, aes(x = connectance, y = nspp)) +
+  geom_point(alpha = 0.3, size = 2) +
+  labs(x = "Connectance", y = "Species richness") +
+  my_theme
+
+# Plot nexpl against nvictim
+plot_nexpl_nvictim <- ggplot(table_networks, aes(x = nexpl, y = nvictim)) +
+  geom_point(alpha = 0.3, size = 2) +
+  labs(x = expression(paste(italic(n)," exploiters")), y = expression(paste(italic(n)," victims"))) +
+  my_theme
+
+# Plot distribution of alpha values
+plot_alpha_dist <- ggplot(table_networks, aes(x = alpha)) +
+  geom_histogram(binwidth = 0.1, fill = "black", color = "black", alpha = 0.3) +
+  labs(x = expression(alpha)) +
+  my_theme
+
+# Plot distribution of complexity index
+plot_compidx_dist <- ggplot(table_networks, aes(x = complexity_index)) +
+  geom_histogram(binwidth = 0.1, fill = "black", color = "black", alpha = 0.3) +
+  labs(x = expression(sqrt(C * S))) +
+  my_theme
+
+
+# Plot distribution of entropy with a vertical line at x = 1
+#plot_entropy_dist <- ggplot(table_networks, aes(x = entropy)) +
+ # geom_histogram(binwidth = 0.1, fill = "black", color = "black", alpha = 0.3) +
+ # geom_vline(xintercept = 1, linetype = "dashed", color = "red") +
+ # labs(x = expression(paste(italic(SVD), " entropy"))) +
+ # my_theme
+
+# Plot entropy_d against complexity index
+#plot_entropy_compidx <- ggplot(table_networks, aes(x = entropy, y = complexity_index)) +
+ # geom_point(alpha = 0.3, size = 2) +
+ # labs(x = expression(paste(italic(SVD), " entropy")), y = expression(sqrt(C * S))) +
+ # my_theme
+
+# Combine plots
+combined_plots <- ggarrange(
+  plot_mod_nest + labs(title = NULL),
+  plot_conn_nspp + labs(title = NULL),
+  plot_nexpl_nvictim + labs(title = NULL),
+  plot_alpha_dist + labs(title = NULL),
+  plot_compidx_dist + labs(title = NULL),
+  ncol = 2, nrow = 3,
+  
+  labels = LETTERS[1:5]
+)
+
+combined_plots
+
+# Save the combined plot
+# ggsave(here::here("figures/supplmat/combined_plots.png"), combined_plots, width = 7, height = 9)
+
+```
+
+
+
+
+# Net effects on species ~ structure
+
+
+
+```{r}
+p_nev_h <- ggplot(table_networks, aes(x = nexpl, y = nvictim)) +  
+    geom_point(aes(color = T_nf1_s, size = nspp), alpha = 0.6) +  
+    labs(x = expression(paste(italic(n), " exploiters")), y = expression(paste(italic(n), " victims"))) +
+    scale_color_viridis_c(name = expression(italic((H[b]))),
+                          option = "turbo") +
+    my_theme
+
+
+p_c_h <- ggplot(table_networks, aes(x = connectance, y = T_nf1_s)) +  
+    geom_point(aes(size = nspp), alpha = 0.4) +  
+    labs(x = "Connectance", y = expression(paste("Biotic effects evennness ",italic((H[b]))))) +
+  #  scale_color_viridis_c(name = "Mean effect inn") +
+    my_theme
+
+ggarrange(
+  
+  p_nev_h,
+  p_c_h,
+  
+  ncol = 2,
+  nrow = 1,
+  
+  common.legend = TRUE,
+  
+  labels = LETTERS[1:2]
+)
+
+#ggsave(here::here("figures/supplmat/nve_c_h.png"), height = 7, width = 10)
+
+```
+
+
+
+## Plots
+
+
+### Normalized shannon
+
+
+```{r}
+  
+  # Plot modularity against nestedness with T_mean and T_nf1_mean
+  p_mod_nest_effects <-   ggplot(table_networks, aes(x = modularity, y = NODF)) +  
+    geom_point(aes(color = T_nf1_s, size = nspp), alpha = 0.7) +  
+    labs(x = "Modularity", y = expression(paste("Nestedness ", italic((NODF)))),
+           size = expression(italic(S))) +
+        scale_color_viridis_c(name = expression(italic((H[b]))), option = "turbo") +
+    my_theme
+  
+  
+  # Plot distribution of complexity index with T_mean and T_nf1_mean as vertical lines
+  plot_complexity_effects <- ggplot(table_networks, aes(x = complexity_index, y = T_nf1_s)) +
+    geom_point( alpha = 0.5, size = 3) +
+    labs(x = expression(sqrt(C * S)),
+         y =expression(paste("Biotic effects evennness ",italic((H))))) +
+    my_theme
+  
+
+  
+  
+  
+  df_centrality <- data.frame("betw" = unlist(table_networks$betw),
+                              "degree" = unlist(table_networks$degree),
+                              "T_nf1_s_vec" = unlist(table_networks$T_nf1_s_vec))
+  
+  
+  
+  plot_degree_effects <- ggplot(df_centrality, aes(x = sqrt(degree), y = T_nf1_s_vec)) +
+    geom_point( alpha = 0.3) +
+    labs(x = "Species degree",
+         y = expression(paste("Biotic effects evennness ",italic((H))))) +
+    scale_x_continuous(labels = back_transform_sqrt)+
+    my_theme
+  
+  
+  
+  fig1 <- ggarrange(
+    
+    plot_complexity_effects,
+    p_mod_nest_effects,
+    plot_degree_effects,
+    
+    
+    ncol = 3,
+    nrow = 1,
+    
+    common.legend = TRUE,
+    
+    labels = c("D", "E", "F")
+    
+    
+  )
+  
+  fig1
+```
+
+Save plots as objects to combine them afterwards in script **simulation_simulated_networks.Rmd** and form figure 4.
+
+```{r}
+#ggsave(here::here("figures/fig1.png"), height = 5, width = 12)
+saveRDS(plot_complexity_effects,here::here("figures/plot_complexity_effects.rds"))
+saveRDS(p_mod_nest_effects,here::here("figures/p_mod_nest_effects.rds"))
+saveRDS(plot_degree_effects,here::here("figures/plot_degree_effects.rds"))
+```
+
+
+
+
+### Non-normalized shannon
+
+```{r}
+
+  # Plot modularity against nestedness with T_mean and T_nf1_mean
+  p_mod_nest_effects_nonorm <-   ggplot(table_networks, aes(x = modularity, y = NODF)) +  
+    geom_point(aes(color = T_nonorm_nf1_s, size = nspp), alpha = 0.7) +  
+    labs(x = "Modularity", y = expression(paste("Nestedness ", italic((NODF)))),
+           size = expression(italic(S))) +
+        scale_color_viridis_c(name = expression(italic((H))), option = "turbo") +
+    my_theme
+  
+  
+  # Plot distribution of complexity index with T_mean and T_nf1_mean as vertical lines
+  plot_complexity_effects_nonorm <- ggplot(table_networks, aes(x = complexity_index, y = T_nonorm_nf1_s)) +
+    geom_point( alpha = 0.5, size = 3) +
+    labs(x = expression(sqrt(C * S)),
+         y =expression(paste("Biotic effects evennness ",italic((H))))) +
+    my_theme
+  
+
+  
+  
+  
+  df_centrality <- data.frame("betw" = unlist(table_networks$betw),
+                              "degree" = unlist(table_networks$degree),
+                              "T_nonorm_nf1_s_vec" = unlist(table_networks$T_nonorm_nf1_s_vec))
+  
+  
+  
+  plot_degree_effects_nonorm <- ggplot(df_centrality, aes(x = sqrt(degree), y = T_nonorm_nf1_s_vec)) +
+    geom_point( alpha = 0.3) +
+    labs(x = "Species degree",
+         y = expression(paste("Biotic effects evennness ",italic((H))))) +
+    scale_x_continuous(labels = back_transform_sqrt)+
+    my_theme
+  
+  
+  
+  
+  
+  plot_complexity_effects_nonorm
+  p_mod_nest_effects_nonorm
+  plot_degree_effects_nonorm
+  
+  
+    
+  fig_appendix_hraw <- ggarrange(
+    
+    plot_complexity_effects_nonorm,
+    p_mod_nest_effects_nonorm,
+    plot_degree_effects_nonorm,
+    
+    
+    ncol = 3,
+    nrow = 1,
+    
+    common.legend = TRUE,
+    
+    labels = c("A", "B", "C")
+    
+    
+  )
+  
+  fig_appendix_hraw
+  
+
+```
+
+
+#### comparison normalized vs non-normalized shannon
+
+```{r}
+# Combine normalized and raw values into a single data frame
+df_all_values <- data.frame(
+  H_norm = unlist(table_networks$T_nf1_s_vec),
+  H_raw = unlist(table_networks$T_nonorm_nf1_s_vec)
+)
+
+# Compute the Pearson correlation
+correlation_all <- cor(df_all_values$H_norm, df_all_values$H_raw, use = "complete.obs")
+
+# Scatter plot of normalized vs raw values
+ggplot(df_all_values, aes(x = H_norm, y = H_raw)) +
+  geom_point(alpha = 0.5, size = 0.5) +
+  labs(
+    x = expression(paste("Normalized biotic effects evennness ",italic((H)))),
+    y = expression(paste("Raw biotic effects evennness ",italic((H)))),
+    title = paste("Pearson correlation =", round(correlation_all, 2))
+  ) +
+  theme_minimal()+
+  theme(
+    plot.title = element_text(hjust = 0.5) # Center the title
+  )
+
+#ggsave(here::here("figures/figS_hcor.png"), height = 5, width = 4)
+
+```

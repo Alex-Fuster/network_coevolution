@@ -1,0 +1,2016 @@
+---
+title: "R Notebook"
+---
+
+This script runs coevolutionary simulations on each simulated network and generates figures illustrating the relationships between network structural properties and measures of coevolution.
+
+The simulation includes an option to introduce abiotic perturbations by shifting species' environmental optima. These perturbation scenarios were not used in the article **Trapped in the web: network architectures spread coevolution and shape adaptation**. The simulation function includes an argument that controls whether such perturbations are applied and is currently set to exclude them.
+
+
+
+
+```{r}
+library(tidyverse)
+library(ggplot2)
+library(reshape2)
+library(tidyr)
+library(dplyr)
+library(ggpubr)
+library(viridis)
+library(grid)
+library(bipartite) # to use the networklevel() function to calculate modularity and nestedness
+library(igraph)
+
+# Custom functions
+
+source(here::here("functions/Functions.R"))
+source(here::here("functions/load_computation.R"))
+
+```
+
+
+
+
+## prepare df scenarios
+
+Read empirical networks table
+
+```{r}
+
+df_network_metrics <- readRDS(here::here("output/df_metrics_simulated_nets.rds"))
+
+df_replicates <- df_network_metrics %>%
+ slice(rep(row_number(), each = 15))
+
+```
+
+
+
+
+## set storing objects
+
+```{r}
+
+
+df_replicates <- df_replicates %>% 
+  mutate(
+  
+  
+# trait values at equilibrium
+    
+traits_eq = vector("list", nrow(df_replicates)),
+teta = vector("list", nrow(df_replicates)),
+
+
+
+# evolutionary rate
+
+comm_evolr = vector("list", nrow(df_replicates)),
+v_evolr = vector("list", nrow(df_replicates)),
+e_evolr = vector("list", nrow(df_replicates)),
+
+
+# mean fluctuation in trait matching
+
+comm_fcij = vector("list", nrow(df_replicates)),
+v_fcij = vector("list", nrow(df_replicates)),
+e_fcij = vector("list", nrow(df_replicates)),
+    
+
+# mean fitness load
+
+comm_load_total = vector("list", nrow(df_replicates)),
+comm_load_biot = vector("list", nrow(df_replicates)),
+comm_load_abiot = vector("list", nrow(df_replicates)),
+comm_load_network = vector("list", nrow(df_replicates)),
+
+v_load_total = vector("list", nrow(df_replicates)),
+v_load_biot = vector("list", nrow(df_replicates)),
+v_load_abiot = vector("list", nrow(df_replicates)),
+v_load_network = vector("list", nrow(df_replicates)),
+
+e_load_total = vector("list", nrow(df_replicates)),
+e_load_biot = vector("list", nrow(df_replicates)),
+e_load_abiot = vector("list", nrow(df_replicates)),
+e_load_network = vector("list", nrow(df_replicates)),
+
+
+)
+
+
+```
+
+
+
+## create dataframes for perturbation scenarios
+
+```{r}
+#df_replicates_pert1 = df_replicates 
+#df_replicates_pert2 = df_replicates 
+```
+
+
+## set fixed parameters
+
+```{r}
+
+nsims <- 300
+her <- 0.22 # heritability
+e <- 0.5 # # e (epsilon trait distance)
+b <- 10 # b (b expoent exploiter preference)
+
+
+# Set values of biotic selection
+
+bio_sel_v<-0.16
+bio_sel_e<-0.16
+
+ksi_hosts<-1-bio_sel_v
+ksi_exploiters<- 1-bio_sel_e
+
+
+# simulate perturbations?
+
+simulate_perturbation1 = "no"
+simulate_perturbation2 = "no"
+
+```
+
+
+## simulation
+
+
+```{r}
+
+
+set.seed(1000)
+
+
+for (sc in 1:nrow(df_replicates)) {
+  
+  
+  print(paste(sprintf("Right now I am doing iteration %s", sc), "of", nrow(df_replicates)))
+  
+  
+  
+  
+  # get the network
+  
+  binary.matrix <- unname(as.matrix(df_replicates$binmat[sc][[1]]))
+  
+  # add at least one interaction to those species disconnected
+  
+  binary.matrix <- assign_interactions(binary.matrix)
+  
+  
+  bigmat.F <- create_F(binary.matrix)
+  
+  # set the number of species
+  
+  n.host <- nrow(binary.matrix)
+  n.exploiter <- ncol(binary.matrix)
+  nsp <- n.host + n.exploiter
+  
+  
+  # store objects for simulation
+  
+  trait <- matrix(0, nrow=nsims, ncol=nsp)   ### store trait values in each timestep for each sp
+  z.change <- matrix(0, nrow=nsims, ncol=nsp)  ### store trait changes in each timestep for each sp
+  trait[1,] <- rnorm(nsp, mean=0, sd=0.1) #Initial trait value randomly sampled
+  teta <- trait[1,] #environmental obtimum = initial z value
+  df_replicates$teta[[sc]] <- teta # save teta
+  cummulative.matching.change <- matrix(0, nrow=n.host, ncol=n.exploiter)
+  ksi<-c(rep(ksi_hosts, n.host),rep(ksi_exploiters, n.exploiter)) # set strengh of abiotic selection vector
+  
+  
+  
+ 
+   #######################################################
+  
+# Define the maximum number of timesteps without change to consider equilibrium
+max_stable_timesteps <- 20
+
+# Initialize a counter to keep track of consecutive timesteps with no change
+stable_timesteps <- 0
+
+# Initialize a matrix to store the trait values of the previous timestep
+previous_traits <- matrix(NA, nrow = nsims, ncol = nsp)
+
+# Copy the trait values from the first timestep to the previous_traits matrix
+previous_traits[1, ] <- trait[1, ]
+  
+  
+  
+  for (sim in 1:(nsims-1)) {
+    
+    
+        # Store the trait values before updating
+    previous_traits[sim + 1, ] <- trait[sim, ]
+    
+    
+    a.matrix <- create_a_matrix(trait_vec = trait[sim,], Fmat = bigmat.F)  # Create matrix of differences in trait values for those species that interact
+    
+    E <- ksi * (teta - trait[sim,]) #Calculate env.sel for each sp
+    
+    
+    Rh<-calc_Rh(a_matrix = a.matrix, big_mat = bigmat.F,KSI.b = bio_sel_v, n_host = n.host, e_threshold = e)  # Calculate interaction selection for victims & store it in vector Rh
+    Rp<-calc_Rp(a_matrix= a.matrix, big_mat=bigmat.F, KSI.b = bio_sel_e, B=b, n_host=n.host, n_exploiter=n.exploiter,nsp=nsp)  # Calculate interaction selection for exploiters & store it in vector Rp
+    
+    
+  
+    # Compute Trait evolution
+    
+    R <- c(Rh, Rp) # Biotic selection for victims and exploiters
+    if( length(R) != length(E)) stop("something is wrong") #test R & E have same length 
+    z.change[sim,] <- her * (R + E) 
+    trait[sim+1,] <- trait[sim,] + z.change[sim,] 
+    
+    
+    
+    # Update a.matrix
+    
+    dif.traits2 <- outer(trait[sim+1,], trait[sim+1,], FUN= "-") 
+    a.matrixsim2 <- bigmat.F*dif.traits2 
+    
+    
+    # Calculate change in trait matching with time
+    
+    matching.change.matrix <- a.matrixsim2[1:n.host, (n.host+1):nsp] -a.matrix[1:n.host, (n.host+1):nsp]
+    cummulative.matching.change <- cummulative.matching.change + abs(matching.change.matrix)
+    
+    
+
+    
+    
+     # Check if we've reached the stage where we can test for equilibrium
+    if (sim >= max_stable_timesteps) {
+        # Check if all trait values are the same as the previous timestep's trait values
+        if (isTRUE(all.equal(trait[sim, ], previous_traits[sim, ], tolerance = 1e-10))) {
+            stable_timesteps <- stable_timesteps + 1
+           # cat("Stable timesteps:", stable_timesteps, "\n")
+        } else {
+            # Reset the stable_timesteps counter if there's a change
+            stable_timesteps <- 0
+        }
+        
+        # If trait values have remained unchanged for the specified number of timesteps, stop the simulation
+        if (stable_timesteps >= max_stable_timesteps) {
+            message("Equilibrium reached. Stopping simulation at timestep ", sim)
+            break
+        }
+    }
+    
+    
+  }
+  
+  
+  #######################################################
+  
+  
+  # save trait values at equilibrium
+  
+df_replicates$traits_eq[[sc]] <- trait[nrow(trait),]
+  
+    
+  # Evolutionary rate
+  
+  
+  df_replicates$comm_evolr[[sc]] <- colSums(abs(z.change))/nsims
+  df_replicates$v_evolr[[sc]] <- colSums(abs(z.change[,1:n.host]))/nsims
+  df_replicates$e_evolr[[sc]]  <- colSums(abs(z.change[,(n.host+1):nsp]))/nsims
+  
+  
+  
+    
+  # mean fluctuation in trait matching
+  
+  df_replicates$v_fcij[[sc]] <-rowSums(cummulative.matching.change)
+  df_replicates$e_fcij[[sc]] <- colSums(cummulative.matching.change)
+  df_replicates$comm_fcij[[sc]] <- c(rowSums(cummulative.matching.change), colSums(cummulative.matching.change))
+  
+  
+  
+  
+  # fitness load
+  
+  ### --- Victims
+  
+  simv_load_total <- numeric(length(n.host))
+  simv_load_abiot <- numeric(length(n.host))
+  simv_load_biot <- numeric(length(n.host))
+  simv_load_network <- numeric(length(n.host))
+  
+  for (v in 1:n.host) {
+    
+    simv_load_total[v] <- fitness_load_victims(epsilon = e,
+                                               x_s = trait[nrow(trait), v],
+                                               x_0 = teta[v], 
+                                               x_partners = abs(a.matrix[,v]))$load
+    simv_load_abiot[v] <- fitness_load_victims(epsilon = e, x_s = trait[nrow(trait), v], x_0 = teta[v], x_partners = abs(a.matrix[,v]))$abiotic_L
+    simv_load_biot[v] <- fitness_load_victims(epsilon = e, x_s = trait[nrow(trait), v], x_0 = teta[v], x_partners = abs(a.matrix[,v]))$biotic_L
+
+    
+  }
+  
+  
+  df_replicates$v_load_total[[sc]] <- simv_load_total
+  df_replicates$v_load_abiot[[sc]] <- simv_load_abiot
+  df_replicates$v_load_biot[[sc]] <- simv_load_biot
+  df_replicates$v_load_network[[sc]] <- simv_load_network
+  
+  
+  ### --- Exploiters
+  
+  sime_load_total <- numeric(length(n.host))
+  sime_load_abiot <- numeric(length(n.host))
+  sime_load_biot <- numeric(length(n.host))
+  sime_load_network <- numeric(length(n.host))
+  
+  index <- 1
+  
+  for (e in (n.host+1):nsp) {
+    
+    sime_load_total[index] <- fitness_load_exploiters(x_s = trait[nrow(trait), e], x_0 = teta[e], x_partners = abs(a.matrix[,e]))$load
+    sime_load_abiot[index] <- fitness_load_exploiters(x_s = trait[nrow(trait), e], x_0 = teta[e], x_partners = abs(a.matrix[,e]))$abiotic_L
+    sime_load_biot[index] <- fitness_load_exploiters(x_s = trait[nrow(trait), e], x_0 = teta[e], x_partners = abs(a.matrix[,e]))$biotic_L
+    sime_load_network[index] <- fitness_load_exploiters(x_s = trait[nrow(trait), e], x_0 = teta[e], x_partners = abs(a.matrix[,e]))$network_L
+    
+    index = index + 1
+    
+  }
+  
+  df_replicates$e_load_total[[sc]] <- sime_load_total
+  df_replicates$e_load_abiot[[sc]] <- sime_load_abiot
+  df_replicates$e_load_biot[[sc]] <- sime_load_biot
+  df_replicates$e_load_network[[sc]] <- sime_load_network
+  
+  
+  ### --- Community
+  
+  df_replicates$comm_load_total[[sc]] <- c(simv_load_total,sime_load_total)
+  df_replicates$comm_load_abiot[[sc]] <- c(simv_load_abiot, sime_load_abiot)
+  df_replicates$comm_load_biot[[sc]] <- c(simv_load_biot, sime_load_biot)
+  df_replicates$comm_load_network[[sc]] <- c(simv_load_network, sime_load_network)
+  
+  
+  
+  
+  if(simulate_perturbation1 == "yes"){
+  
+  
+  #################################################################
+  #################################################################
+  #                       PERTURBATION 1
+  #################################################################
+  #################################################################
+  
+
+  # store objects for simulation
+  
+  trait <- matrix(0, nrow=nsims, ncol=nsp)   ### store trait values in each timestep for each sp
+  z.change <- matrix(0, nrow=nsims, ncol=nsp)  ### store trait changes in each timestep for each sp
+  trait[1,] <- df_replicates$traits_eq[[sc]] # traits at equilibrium from nonperturbed simulation
+  teta <- df_replicates$teta[[sc]] # teta from nonperturbed simulation
+  cummulative.matching.change <- matrix(0, nrow=n.host, ncol=n.exploiter)
+  
+ 
+   #######################################################
+  
+# Define the maximum number of timesteps without change to consider equilibrium
+max_stable_timesteps <- 20
+
+# Initialize a counter to keep track of consecutive timesteps with no change
+stable_timesteps <- 0
+
+# Initialize a matrix to store the trait values of the previous timestep
+previous_traits <- matrix(NA, nrow = nsims, ncol = nsp)
+
+# Copy the trait values from the first timestep to the previous_traits matrix
+previous_traits[1, ] <- trait[1, ]
+  
+  
+
+
+# PERTURBATION:
+
+teta = sapply(teta, random_change_teta, SD = 2)
+
+
+
+  for (sim in 1:(nsims-1)) {
+
+    
+    
+            # Store the trait values before updating
+    previous_traits[sim + 1, ] <- trait[sim, ]
+    
+    
+    a.matrix <- create_a_matrix(trait_vec = trait[sim,], Fmat = bigmat.F)  # Create matrix of differences in trait values for those species that interact
+    
+    E <- ksi * (teta - trait[sim,]) #Calculate env.sel for each sp
+    
+    
+    Rh<-calc_Rh(a_matrix = a.matrix, big_mat = bigmat.F,KSI.b = bio_sel_v, n_host = n.host, e_threshold = e)  # Calculate interaction selection for victims & store it in vector Rh
+    Rp<-calc_Rp(a_matrix= a.matrix, big_mat=bigmat.F, KSI.b = bio_sel_e, B=b, n_host=n.host, n_exploiter=n.exploiter,nsp=nsp)  # Calculate interaction selection for exploiters & store it in vector Rp
+    
+    
+  
+    # Compute Trait evolution
+    
+    R <- c(Rh, Rp) # Biotic selection for victims and exploiters
+    if( length(R) != length(E)) stop("something is wrong") #test R & E have same length 
+    z.change[sim,] <- her * (R + E) 
+    trait[sim+1,] <- trait[sim,] + z.change[sim,] 
+    
+    
+    
+    # Update a.matrix
+    
+    dif.traits2 <- outer(trait[sim+1,], trait[sim+1,], FUN= "-") 
+    a.matrixsim2 <- bigmat.F*dif.traits2 
+    
+    
+    # Calculate change in trait matching with time
+    
+    matching.change.matrix <- a.matrixsim2[1:n.host, (n.host+1):nsp] -a.matrix[1:n.host, (n.host+1):nsp]
+    cummulative.matching.change <- cummulative.matching.change + abs(matching.change.matrix)
+    
+    
+    
+    
+    
+     # Check if we've reached the stage where we can test for equilibrium
+    if (sim >= max_stable_timesteps) {
+        # Check if all trait values are the same as the previous timestep's trait values
+        if (isTRUE(all.equal(trait[sim, ], previous_traits[sim, ], tolerance = 1e-10))) {
+            stable_timesteps <- stable_timesteps + 1
+           # cat("Stable timesteps:", stable_timesteps, "\n")
+        } else {
+            # Reset the stable_timesteps counter if there's a change
+            stable_timesteps <- 0
+        }
+        
+        # If trait values have remained unchanged for the specified number of timesteps, stop the simulation
+        if (stable_timesteps >= max_stable_timesteps) {
+            message("Equilibrium reached. Stopping simulation at timestep ", sim)
+            break
+        }
+    }
+    
+    
+  }
+  
+  
+  #######################################################
+  
+  
+  # save trait values at equilibrium
+  
+df_replicates_pert1$traits_eq[[sc]] <- trait[nrow(trait),]
+  
+    
+  # Evolutionary rate
+  
+  
+  df_replicates_pert1$comm_evolr[[sc]] <- colSums(abs(z.change))/nsims
+  df_replicates_pert1$v_evolr[[sc]] <- colSums(abs(z.change[,1:n.host, drop=FALSE]))/nsims
+  df_replicates_pert1$e_evolr[[sc]]  <- colSums(abs(z.change[,(n.host+1):nsp, drop=FALSE]))/nsims
+  
+  
+  
+    
+  # mean fluctuation in trait matching
+  
+  df_replicates_pert1$v_fcij[[sc]] <-rowSums(cummulative.matching.change)
+  df_replicates_pert1$e_fcij[[sc]] <- colSums(cummulative.matching.change)
+  df_replicates_pert1$comm_fcij[[sc]] <- c(rowSums(cummulative.matching.change), colSums(cummulative.matching.change))
+  
+  
+  
+  
+  # fitness load
+  
+  ### --- Victims
+  
+  simv_load_total <- numeric(length(n.host))
+  simv_load_abiot <- numeric(length(n.host))
+  simv_load_biot <- numeric(length(n.host))
+  simv_load_network <- numeric(length(n.host))
+  
+  for (v in 1:n.host) {
+    
+    simv_load_total[v] <- fitness_load(x_s = trait[nrow(trait), v], x_0 = teta[v], x_partners = abs(a.matrix[,v]))$load
+    simv_load_abiot[v] <- fitness_load(x_s = trait[nrow(trait), v], x_0 = teta[v], x_partners = abs(a.matrix[,v]))$abiotic_L
+    simv_load_biot[v] <- fitness_load(x_s = trait[nrow(trait), v], x_0 = teta[v], x_partners = abs(a.matrix[,v]))$biotic_L
+    simv_load_network[v] <- fitness_load(x_s = trait[nrow(trait), v], x_0 = teta[v], x_partners = abs(a.matrix[,v]))$network_L
+    
+  }
+  
+  
+  df_replicates_pert1$v_load_total[[sc]] <- simv_load_total
+  df_replicates_pert1$v_load_abiot[[sc]] <- simv_load_abiot
+  df_replicates_pert1$v_load_biot[[sc]] <- simv_load_biot
+  df_replicates_pert1$v_load_network[[sc]] <- simv_load_network
+  
+  
+ ### --- Exploiters
+  
+  sime_load_total <- numeric(length(n.host))
+  sime_load_abiot <- numeric(length(n.host))
+  sime_load_biot <- numeric(length(n.host))
+  sime_load_network <- numeric(length(n.host))
+  
+  index <- 1
+  
+  for (e in (n.host+1):nsp) {
+    
+    sime_load_total[index] <- fitness_load(x_s = trait[nrow(trait), e], x_0 = teta[e], x_partners = abs(a.matrix[,e]))$load
+    sime_load_abiot[index] <- fitness_load(x_s = trait[nrow(trait), e], x_0 = teta[e], x_partners = abs(a.matrix[,e]))$abiotic_L
+    sime_load_biot[index] <- fitness_load(x_s = trait[nrow(trait), e], x_0 = teta[e], x_partners = abs(a.matrix[,e]))$biotic_L
+    sime_load_network[index] <- fitness_load(x_s = trait[nrow(trait), e], x_0 = teta[e], x_partners = abs(a.matrix[,e]))$network_L
+    
+    index = index + 1
+    
+  }
+  
+  df_replicates_pert1$e_load_total[[sc]] <- sime_load_total
+  df_replicates_pert1$e_load_abiot[[sc]] <- sime_load_abiot
+  df_replicates_pert1$e_load_biot[[sc]] <- sime_load_biot
+  df_replicates_pert1$e_load_network[[sc]] <- sime_load_network
+  
+  ### --- Community
+  
+  df_replicates_pert1$comm_load_total[[sc]] <- c(simv_load_total,sime_load_total)
+  df_replicates_pert1$comm_load_abiot[[sc]] <- c(simv_load_abiot, sime_load_abiot)
+  df_replicates_pert1$comm_load_biot[[sc]] <- c(simv_load_biot, sime_load_biot)
+  df_replicates_pert1$comm_load_network[[sc]] <- c(simv_load_network, sime_load_network)
+  
+  
+  }
+  
+  
+  
+   if(simulate_perturbation2 == "yes"){
+  
+  
+  #################################################################
+  #################################################################
+  #                       PERTURBATION 2
+  #################################################################
+  #################################################################
+  
+
+  # store objects for simulation
+  
+  trait <- matrix(0, nrow=nsims, ncol=nsp)   ### store trait values in each timestep for each sp
+  z.change <- matrix(0, nrow=nsims, ncol=nsp)  ### store trait changes in each timestep for each sp
+  trait[1,] <- df_replicates$traits_eq[[sc]] # traits at equilibrium from nonperturbed simulation
+  teta <- df_replicates$teta[[sc]] # teta from nonperturbed simulation
+  cummulative.matching.change <- matrix(0, nrow=n.host, ncol=n.exploiter)
+  
+ 
+   #######################################################
+  
+# Define the maximum number of timesteps without change to consider equilibrium
+max_stable_timesteps <- 20
+
+# Initialize a counter to keep track of consecutive timesteps with no change
+stable_timesteps <- 0
+
+# Initialize a matrix to store the trait values of the previous timestep
+previous_traits <- matrix(NA, nrow = nsims, ncol = nsp)
+
+# Copy the trait values from the first timestep to the previous_traits matrix
+previous_traits[1, ] <- trait[1, ]
+  
+  
+
+
+
+  for (sim in 1:(nsims-1)) {
+
+    
+    # PERTURBATION:
+    
+    teta[1:n.host] = teta[1:n.host] + 0.01
+    
+    
+            # Store the trait values before updating
+    previous_traits[sim + 1, ] <- trait[sim, ]
+    
+    
+    a.matrix <- create_a_matrix(trait_vec = trait[sim,], Fmat = bigmat.F)  # Create matrix of differences in trait values for those species that interact
+    
+    E <- ksi * (teta - trait[sim,]) #Calculate env.sel for each sp
+    
+    
+    Rh<-calc_Rh(a_matrix = a.matrix, big_mat = bigmat.F,KSI.b = bio_sel_v, n_host = n.host, e_threshold = e)  # Calculate interaction selection for victims & store it in vector Rh
+    Rp<-calc_Rp(a_matrix= a.matrix, big_mat=bigmat.F, KSI.b = bio_sel_e, B=b, n_host=n.host, n_exploiter=n.exploiter,nsp=nsp)  # Calculate interaction selection for exploiters & store it in vector Rp
+    
+    
+  
+    # Compute Trait evolution
+    
+    R <- c(Rh, Rp) # Biotic selection for victims and exploiters
+    if( length(R) != length(E)) stop("something is wrong") #test R & E have same length 
+    z.change[sim,] <- her * (R + E) 
+    trait[sim+1,] <- trait[sim,] + z.change[sim,] 
+    
+    
+    
+    # Update a.matrix
+    
+    dif.traits2 <- outer(trait[sim+1,], trait[sim+1,], FUN= "-") 
+    a.matrixsim2 <- bigmat.F*dif.traits2 
+    
+    
+    # Calculate change in trait matching with time
+    
+    matching.change.matrix <- a.matrixsim2[1:n.host, (n.host+1):nsp] -a.matrix[1:n.host, (n.host+1):nsp]
+    cummulative.matching.change <- cummulative.matching.change + abs(matching.change.matrix)
+    
+    
+    
+    
+    
+     # Check if we've reached the stage where we can test for equilibrium
+    if (sim >= max_stable_timesteps) {
+        # Check if all trait values are the same as the previous timestep's trait values
+        if (isTRUE(all.equal(trait[sim, ], previous_traits[sim, ], tolerance = 1e-10))) {
+            stable_timesteps <- stable_timesteps + 1
+            cat("Stable timesteps:", stable_timesteps, "\n")
+        } else {
+            # Reset the stable_timesteps counter if there's a change
+            stable_timesteps <- 0
+        }
+        
+        # If trait values have remained unchanged for the specified number of timesteps, stop the simulation
+        if (stable_timesteps >= max_stable_timesteps) {
+            message("Equilibrium reached. Stopping simulation at timestep ", sim)
+            break
+        }
+    }
+    
+    
+  }
+  
+  
+  #######################################################
+  
+  
+  # save trait values at equilibrium
+  
+df_replicates_pert2$traits_eq[[sc]] <- trait[nrow(trait),]
+  
+    
+  # Evolutionary rate
+  
+  
+  df_replicates_pert2$comm_evolr[[sc]] <- colSums(abs(z.change))/nsims
+  df_replicates_pert2$v_evolr[[sc]] <- colSums(abs(z.change[,1:n.host, drop=FALSE]))/nsims
+  df_replicates_pert2$e_evolr[[sc]]  <- colSums(abs(z.change[,(n.host+1):nsp, drop=FALSE]))/nsims
+  
+  
+  
+    
+  # mean fluctuation in trait matching
+  
+  df_replicates_pert2$v_fcij[[sc]] <-rowSums(cummulative.matching.change)
+  df_replicates_pert2$e_fcij[[sc]] <- colSums(cummulative.matching.change)
+  df_replicates_pert2$comm_fcij[[sc]] <- c(rowSums(cummulative.matching.change), colSums(cummulative.matching.change))
+  
+  
+  
+  
+  # fitness load
+  
+  ### --- Victims
+  
+  simv_load_total <- numeric(length(n.host))
+  simv_load_abiot <- numeric(length(n.host))
+  simv_load_biot <- numeric(length(n.host))
+  simv_load_network <- numeric(length(n.host))
+  
+  for (v in 1:n.host) {
+    
+    simv_load_total[v] <- fitness_load(x_s = trait[nrow(trait), v], x_0 = teta[v], x_partners = abs(a.matrix[,v]))$load
+    simv_load_abiot[v] <- fitness_load(x_s = trait[nrow(trait), v], x_0 = teta[v], x_partners = abs(a.matrix[,v]))$abiotic_L
+    simv_load_biot[v] <- fitness_load(x_s = trait[nrow(trait), v], x_0 = teta[v], x_partners = abs(a.matrix[,v]))$biotic_L
+    simv_load_network[v] <- fitness_load(x_s = trait[nrow(trait), v], x_0 = teta[v], x_partners = abs(a.matrix[,v]))$network_L
+    
+  }
+  
+  
+  df_replicates_pert2$v_load_total[[sc]] <- simv_load_total
+  df_replicates_pert2$v_load_abiot[[sc]] <- simv_load_abiot
+  df_replicates_pert2$v_load_biot[[sc]] <- simv_load_biot
+  df_replicates_pert2$v_load_network[[sc]] <- simv_load_network
+  
+  
+ ### --- Exploiters
+  
+  sime_load_total <- numeric(length(n.host))
+  sime_load_abiot <- numeric(length(n.host))
+  sime_load_biot <- numeric(length(n.host))
+  sime_load_network <- numeric(length(n.host))
+  
+  index <- 1
+  
+  for (e in (n.host+1):nsp) {
+    
+    sime_load_total[index] <- fitness_load(x_s = trait[nrow(trait), e], x_0 = teta[e], x_partners = abs(a.matrix[,e]))$load
+    sime_load_abiot[index] <- fitness_load(x_s = trait[nrow(trait), e], x_0 = teta[e], x_partners = abs(a.matrix[,e]))$abiotic_L
+    sime_load_biot[index] <- fitness_load(x_s = trait[nrow(trait), e], x_0 = teta[e], x_partners = abs(a.matrix[,e]))$biotic_L
+    sime_load_network[index] <- fitness_load(x_s = trait[nrow(trait), e], x_0 = teta[e], x_partners = abs(a.matrix[,e]))$network_L
+    
+    index = index + 1
+    
+  }
+  
+  df_replicates_pert2$e_load_total[[sc]] <- sime_load_total
+  df_replicates_pert2$e_load_abiot[[sc]] <- sime_load_abiot
+  df_replicates_pert2$e_load_biot[[sc]] <- sime_load_biot
+  df_replicates_pert2$e_load_network[[sc]] <- sime_load_network
+  
+  ### --- Community
+  
+  df_replicates_pert2$comm_load_total[[sc]] <- c(simv_load_total,sime_load_total)
+  df_replicates_pert2$comm_load_abiot[[sc]] <- c(simv_load_abiot, sime_load_abiot)
+  df_replicates_pert2$comm_load_biot[[sc]] <- c(simv_load_biot, sime_load_biot)
+  df_replicates_pert2$comm_load_network[[sc]] <- c(simv_load_network, sime_load_network)
+  
+  
+  }
+  
+
+  
+
+  
+}
+
+
+
+
+
+
+
+
+```
+
+
+
+Save data
+
+```{r}
+saveRDS(df_replicates, "../output/df_15replicates_4apr2025dec_simnets.rds")
+#saveRDS(df_replicates_pert1, "../output/df_1replicates_pert1_5april_simnets.rds.rds")
+#saveRDS(df_replicates_pert2, "../output/df_1replicates_pert2_5april_simnets.rds.rds")
+
+
+df_replicates <- readRDS("../output/df_15replicates_4apr2025dec_simnets.rds")
+#df_replicates_pert1 <- readRDS("../output/df_5replicates_pert1_1april_simnets.rds.rds")
+#df_replicates_pert2 <- readRDS("../output/df_5replicates_pert2_1april_simnets.rds.rds")
+
+```
+
+
+
+# Plotting
+
+```{r}
+df_replicates <- df_replicates %>%
+  mutate(
+    
+    # evolutionary rate
+    mean_comm_evolr = map_dbl(comm_evolr, ~ mean(.x, na.rm = TRUE)),
+    mean_e_evolr = map_dbl(e_evolr, ~ mean(.x, na.rm = TRUE)),
+    mean_v_evolr = map_dbl(v_evolr, ~ mean(.x, na.rm = TRUE)),
+    
+    # trait matching fluctuation
+    mean_comm_fcij = map_dbl(comm_fcij, ~ mean(.x, na.rm = TRUE)),
+    mean_e_fcij = map_dbl(e_fcij, ~ mean(.x, na.rm = TRUE)),
+    mean_v_fcij = map_dbl(v_fcij, ~ mean(.x, na.rm = TRUE)),
+    
+    # fitness load
+    mean_comm_load_total = map_dbl(comm_load_total, ~ mean(.x, na.rm = TRUE)),
+    mean_comm_load_abiot = map_dbl(comm_load_abiot, ~ mean(.x, na.rm = TRUE)),
+    mean_comm_load_biot = map_dbl(comm_load_biot, ~ mean(.x, na.rm = TRUE)),
+    mean_comm_load_network = map_dbl(comm_load_network, ~ mean(.x, na.rm = TRUE)),
+    
+    mean_v_load_total = map_dbl(v_load_total, ~ mean(.x, na.rm = TRUE)),
+    mean_v_load_abiot = map_dbl(v_load_abiot, ~ mean(.x, na.rm = TRUE)),
+    mean_v_load_biot = map_dbl(v_load_biot, ~ mean(.x, na.rm = TRUE)),
+    mean_v_load_network = map_dbl(v_load_network, ~ mean(.x, na.rm = TRUE)),
+    
+    mean_e_load_total = map_dbl(e_load_total, ~ mean(.x, na.rm = TRUE)),
+    mean_e_load_abiot = map_dbl(e_load_abiot, ~ mean(.x, na.rm = TRUE)),
+    mean_e_load_biot = map_dbl(e_load_biot, ~ mean(.x, na.rm = TRUE)),
+    mean_e_load_network = map_dbl(e_load_network, ~ mean(.x, na.rm = TRUE))
+  )
+
+
+```
+
+
+
+Pars for plotting
+
+
+
+```{r}
+
+my_theme<-theme(axis.text=element_text(size=12),
+        axis.title = element_text(size = 14),
+        legend.text=element_text(size=10),
+        legend.title = element_text(size=12),
+        plot.title = element_text(face="bold",size=14,margin=margin(0,0,20,0),hjust = 0.5),
+        axis.title.y = element_text(hjust = 0.5),
+        axis.title.x = element_text(hjust = 0.5))
+
+
+back_transform_sqrt <- function(x) {
+  return(x^2)  # Square back the transformed value
+}
+
+
+# Define the desired order of levels
+custom_order <- c("random", "scale-free", "nested")  # Replace with your desired order
+
+# Convert distribution to a factor with custom order
+df_replicates$distribution <- factor(df_replicates$distribution, levels = custom_order)
+
+```
+
+
+
+
+# evol rate & matching ~ structure
+
+
+## richness
+
+```{r}
+df_plot <- df_replicates %>% 
+  filter(test_metric == "richness") %>% 
+  select(connectance, n,
+         mean_e_evolr, mean_v_evolr, mean_comm_evolr,
+         mean_e_fcij, mean_v_fcij, mean_comm_fcij,
+         NODF,
+         modularity) %>%
+  group_by(n) %>%
+  summarize(mean_mean_e_evolr = mean(mean_e_evolr),
+            mean_mean_v_evolr = mean(mean_v_evolr),
+            mean_mean_comm_evolr = mean(mean_comm_evolr),
+            mean_mean_e_fcij = mean(mean_e_fcij),
+            mean_mean_v_fcij = mean(mean_v_fcij),
+            mean_mean_comm_fcij = mean(mean_comm_fcij),
+            modularity = modularity[1],
+            NODF = NODF[1],
+            connectance[1])
+
+
+s_er_e = ggplot(data = df_plot, aes(x = n, y = mean_mean_e_evolr)) +
+  geom_point(alpha = 0.3, size = 3, color = "#E69F00") +
+# geom_smooth(method = "gam", se = FALSE, color = "red") +
+  labs(x = "Species richness", y = expression(paste("Evolutionary rate ",italic((sigma))^2))) +
+  theme_classic()+
+  my_theme
+
+s_er_v = ggplot(data = df_plot, aes(x = n, y = mean_mean_v_evolr)) +
+  geom_point(alpha = 0.3, size = 3, color = "#009E73") +
+# geom_smooth(method = "gam", se = FALSE, color = "red") +
+  labs(x = "Species richness", y = expression(paste("Evolutionary rate ",italic((sigma))^2))) +
+  theme_classic()+
+  my_theme
+
+s_s_e = ggplot(data = df_plot, aes(x = n, y = mean_mean_e_fcij)) +
+  geom_point(alpha = 0.3, size = 3,color = "#E69F00") +
+# geom_smooth(method = "gam", se = FALSE, color = "red") +
+  labs(x = "Species richness", y = expression(paste("Trait matching fluctuation ",(italic(lambda))))) +
+  theme_classic()+
+  my_theme
+
+s_s_v = ggplot(data = df_plot, aes(x = n, y = mean_mean_v_fcij)) +
+  geom_point(alpha = 0.3, size = 3, color = "#009E73") +
+# geom_smooth(method = "gam", se = FALSE, color = "red") +
+  labs(x = "Species richness", y = expression(paste("Trait matching fluctuation ",(italic(lambda))))) +
+  theme_classic()+
+  my_theme
+
+df_combined <- df_plot %>%
+  select(n, mean_mean_e_fcij, mean_mean_v_fcij) %>%
+  pivot_longer(
+    cols = c(mean_mean_e_fcij, mean_mean_v_fcij),
+    names_to = "group",
+    values_to = "value"
+  ) %>%
+  mutate(group = recode(group, 
+                        mean_mean_e_fcij = "Exploiters", 
+                        mean_mean_v_fcij = "Victims"))
+
+s_s_combined <- ggplot(df_combined, aes(x = n, y = value, color = group)) +
+  geom_point(alpha = 0.6, size = 3) +
+  labs(
+    x = "Species richness",
+    y = expression(paste("Trait matching fluctuation ", (italic(lambda)))),
+    color = NULL
+  ) +
+  scale_color_manual(values = c("Exploiters" = "#E69F00", "Victims" = "#009E73")) +
+  theme_classic() +
+  my_theme
+
+
+s_er_matching = ggarrange(
+  
+  s_er_e, s_er_v,
+  s_s_e, s_s_v,
+  
+  labels = LETTERS[1:4],
+  
+  ncol = 4,
+  nrow = 1
+)
+
+```
+
+
+
+
+## connectance
+
+```{r}
+df_plot <- df_replicates %>% 
+  filter(test_metric == "connectance") %>% 
+  select(connectance, 
+         mean_e_evolr, mean_v_evolr, mean_comm_evolr,
+         mean_e_fcij, mean_v_fcij, mean_comm_fcij,
+         NODF,
+         modularity) %>%
+  group_by(connectance) %>%
+  summarize(mean_mean_e_evolr = mean(mean_e_evolr),
+            mean_mean_v_evolr = mean(mean_v_evolr),
+            mean_mean_comm_evolr = mean(mean_comm_evolr),
+            mean_mean_e_fcij = mean(mean_e_fcij),
+            mean_mean_v_fcij = mean(mean_v_fcij),
+            mean_mean_comm_fcij = mean(mean_comm_fcij),
+            modularity = modularity[1],
+            NODF = NODF[1])
+
+
+c_er_e = ggplot(data = df_plot, aes(x = connectance, y = mean_mean_e_evolr)) +
+  geom_point(alpha = 0.3, size = 3, color = "#E69F00") +
+# geom_smooth(method = "gam", se = FALSE, color = "red") +
+  labs(x = "Connectance", y = expression(paste("Evolutionary rate ",italic((sigma))^2))) +
+  theme_classic()+
+  my_theme
+
+c_er_v = ggplot(data = df_plot, aes(x = connectance, y = mean_mean_v_evolr)) +
+  geom_point(alpha = 0.3, size = 3, color = "#009E73") +
+# geom_smooth(method = "gam", se = FALSE, color = "red") +
+  labs(x = "Connectance", y = expression(paste("Evolutionary rate ",italic((sigma))^2))) +
+  theme_classic()+
+  my_theme
+
+c_s_e = ggplot(data = df_plot, aes(x = connectance, y = mean_mean_e_fcij)) +
+  geom_point(alpha = 0.3, size = 3, color = "#E69F00") +
+# geom_smooth(method = "gam", se = FALSE, color = "red") +
+  labs(x = "Connectance", y = expression(paste("Trait matching fluctuation ",(italic(lambda))))) +
+  theme_classic()+
+  my_theme
+
+c_s_v = ggplot(data = df_plot, aes(x = connectance, y = mean_mean_v_fcij)) +
+  geom_point(alpha = 0.3, size = 3, color = "#009E73") +
+# geom_smooth(method = "gam", se = FALSE, color = "red") +
+  labs(x = "Connectance", y = expression(paste("Trait matching fluctuation ",(italic(lambda))))) +
+  theme_classic()+
+  my_theme
+
+df_combined <- df_plot %>%
+  select(connectance, mean_mean_e_fcij, mean_mean_v_fcij) %>%
+  pivot_longer(
+    cols = c(mean_mean_e_fcij, mean_mean_v_fcij),
+    names_to = "group",
+    values_to = "value"
+  ) %>%
+  mutate(group = recode(group, 
+                        mean_mean_e_fcij = "Exploiters", 
+                        mean_mean_v_fcij = "Victims"))
+
+c_s_combined <- ggplot(df_combined, aes(x = connectance, y = value, color = group)) +
+  geom_point(alpha = 0.6, size = 3) +
+  labs(
+    x = "Connectance",
+    y = expression(paste("Trait matching fluctuation ", (italic(lambda)))),
+    color = NULL
+  ) +
+  scale_color_manual(values = c("Exploiters" = "#E69F00", "Victims" = "#009E73")) +
+  theme_classic() +
+  my_theme
+
+
+c_er_matching = ggarrange(
+  
+  c_er_e, c_er_v,
+  c_s_e, c_s_v,
+  
+  labels = LETTERS[5:8],
+  
+  ncol = 4,
+  nrow = 1
+)
+
+```
+
+
+## nestedness
+
+```{r}
+df_plot <- df_replicates %>% 
+  filter(test_metric == "nestedness") %>% 
+  select(connectance, nestedness,
+         mean_e_evolr, mean_v_evolr, mean_comm_evolr,
+         mean_e_fcij, mean_v_fcij, mean_comm_fcij,
+         NODF,
+         modularity) %>%
+  group_by(nestedness) %>%
+  summarize(mean_mean_e_evolr = mean(mean_e_evolr),
+            mean_mean_v_evolr = mean(mean_v_evolr),
+            mean_mean_comm_evolr = mean(mean_comm_evolr),
+            mean_mean_e_fcij = mean(mean_e_fcij),
+            mean_mean_v_fcij = mean(mean_v_fcij),
+            mean_mean_comm_fcij = mean(mean_comm_fcij),
+            modularity = modularity[1],
+            NODF = NODF[1],
+            connectance = connectance[1])
+
+
+nest_er_e = ggplot(data = df_plot, aes(x = nestedness, y = mean_mean_e_evolr)) +
+  geom_point(alpha = 0.3, size = 3, color = "#E69F00") +
+# geom_smooth(method = "gam", se = FALSE, color = "red") +
+  labs(x = expression(paste("Nestedness ", italic((NODF)))), y = expression(paste("Evolutionary rate ",italic((sigma))^2))) +
+  theme_classic()+
+  my_theme
+
+nest_er_v = ggplot(data = df_plot, aes(x = nestedness, y = mean_mean_v_evolr)) +
+  geom_point(alpha = 0.3, size = 3, color = "#009E73") +
+# geom_smooth(method = "gam", se = FALSE, color = "red") +
+  labs(x = expression(paste("Nestedness ", italic((NODF)))), y = expression(paste("Evolutionary rate ",italic((sigma))^2))) +
+  theme_classic()+
+  my_theme
+
+nest_s_e = ggplot(data = df_plot, aes(x = nestedness, y = mean_mean_e_fcij)) +
+  geom_point(alpha = 0.3, size = 3, color = "#E69F00") +
+# geom_smooth(method = "gam", se = FALSE, color = "red") +
+  labs(x = expression(paste("Nestedness ", italic((NODF)))), y = expression(paste("Trait matching fluctuation ",(italic(lambda))))) +
+  theme_classic()+
+  my_theme
+
+nest_s_v = ggplot(data = df_plot, aes(x = nestedness, y = mean_mean_v_fcij)) +
+  geom_point(alpha = 0.3, size = 3, color = "#009E73") +
+# geom_smooth(method = "gam", se = FALSE, color = "red") +
+  labs(x = expression(paste("Nestedness ", italic((NODF)))), y = expression(paste("Trait matching fluctuation ",(italic(lambda))))) +
+  theme_classic()+
+  my_theme
+
+df_combined <- df_plot %>%
+  select(nestedness, mean_mean_e_fcij, mean_mean_v_fcij) %>%
+  pivot_longer(
+    cols = c(mean_mean_e_fcij, mean_mean_v_fcij),
+    names_to = "group",
+    values_to = "value"
+  ) %>%
+  mutate(group = recode(group, 
+                        mean_mean_e_fcij = "Exploiters", 
+                        mean_mean_v_fcij = "Victims"))
+
+nest_s_combined <- ggplot(df_combined, aes(x = nestedness, y = value, color = group)) +
+  geom_point(alpha = 0.6, size = 3) +
+  labs(
+    x = expression(paste("Nestedness ", italic((NODF)))),
+    y = expression(paste("Trait matching fluctuation ", (italic(lambda)))),
+    color = NULL
+  ) +
+  scale_color_manual(values = c("Exploiters" = "#E69F00", "Victims" = "#009E73")) +
+  theme_classic() +
+  my_theme
+
+
+nest_er_matching = ggarrange(
+  
+  nest_er_e, nest_er_v,
+  nest_s_e, nest_s_v,
+  
+  labels = LETTERS[9:12],
+  
+  ncol = 4,
+  nrow = 1
+)
+
+```
+
+
+
+
+## modularity & nestedness
+
+```{r}
+df_plot <- df_replicates %>% 
+  filter(test_metric == "nestedness") %>% 
+  select(modularity, NODF,
+         mean_e_evolr, mean_v_evolr, mean_comm_evolr,
+         mean_e_fcij, mean_v_fcij, mean_comm_fcij) %>%
+  filter(!is.na(modularity), !is.na(NODF)) |> 
+  group_by(modularity) %>%
+  summarize(mean_mean_e_evolr = mean(mean_e_evolr),
+            mean_mean_v_evolr = mean(mean_v_evolr),
+            mean_mean_comm_evolr = mean(mean_comm_evolr),
+            mean_mean_e_fcij = mean(mean_e_fcij),
+            mean_mean_v_fcij = mean(mean_v_fcij),
+            mean_mean_comm_fcij = mean(mean_comm_fcij),
+            modularity = modularity[1],
+            NODF = NODF[1])
+
+
+# Plot 2: Evolutionary rate (??²)
+plot_modnest_evolr_e <- ggplot(df_plot, aes(x = modularity, y = NODF, color = mean_mean_e_evolr)) +
+  geom_point(size = 4, alpha = 0.8) +
+  scale_color_viridis_c(
+    name = expression(italic(sigma^2)),
+    option = "turbo"
+  ) +
+  labs(x = "Modularity", y = expression(paste("Nestedness ", italic(NODF)))) +
+  theme_classic() +
+  theme(
+    legend.position = c(0.98, 0.98),
+    legend.justification = c("right", "top"),
+    legend.background = element_rect(fill = "white", color = "gray80"),
+    legend.key.size = unit(0.5, "cm"),
+    legend.title.align = 0.5
+  ) +
+  my_theme
+
+
+
+# Plot 2: Evolutionary rate (??²)
+plot_modnest_evolr_v <- ggplot(df_plot, aes(x = modularity, y = NODF, color = mean_mean_v_evolr)) +
+  geom_point(size = 4, alpha = 0.8, shape = 17) +
+  scale_color_viridis_c(
+    name = expression(italic(sigma^2)),
+    option = "turbo"
+  ) +
+  labs(x = "Modularity", y = expression(paste("Nestedness ", italic(NODF)))) +
+  theme_classic() +
+  theme(
+    legend.position = c(0.98, 0.98),
+    legend.justification = c("right", "top"),
+    legend.background = element_rect(fill = "white", color = "gray80"),
+    legend.key.size = unit(0.5, "cm"),
+    legend.title.align = 0.5
+  ) +
+  my_theme
+
+
+# Prepare data for combined plot with both groups
+df_combined_modnest <- df_plot %>%
+  select(modularity, NODF, mean_mean_e_fcij, mean_mean_v_fcij) %>%
+  pivot_longer(
+    cols = c(mean_mean_e_fcij, mean_mean_v_fcij),
+    names_to = "group",
+    values_to = "value"
+  ) %>%
+  mutate(group = recode(group, 
+                        mean_mean_e_fcij = "Exploiters", 
+                        mean_mean_v_fcij = "Victims"))
+
+# Create the plot
+plot_modnest_fcij_combined <- ggplot(df_combined_modnest, aes(x = modularity, y = NODF, color = value)) +
+  geom_point(aes(shape = group), size = 3, alpha = 0.8) +
+  scale_color_viridis_c(
+    name = expression(italic(lambda)),
+    option = "turbo"
+  ) +
+  scale_shape_manual(values = c("Exploiters" = 16, "Victims" = 17)) +
+  guides(shape = "none") +
+  labs(x = "Modularity", y = expression(paste("Nestedness ", italic(NODF)))) +
+  theme_classic() +
+  theme(
+    legend.position = c(0.98, 0.98),
+    legend.justification = c("right", "top"),
+    legend.background = element_rect(fill = "white", color = "gray80"),
+    legend.key.size = unit(0.5, "cm"),
+    legend.title.align = 0.5
+  ) +
+  my_theme
+
+
+
+```
+
+
+
+
+
+## modularity
+
+```{r}
+df_plot <- df_replicates %>% 
+  filter(test_metric == "nestedness") %>% 
+  select(connectance, nestedness,
+         mean_e_evolr, mean_v_evolr, mean_comm_evolr,
+         mean_e_fcij, mean_v_fcij, mean_comm_fcij,
+         NODF,
+         modularity) %>%
+  group_by(modularity) %>%
+  summarize(mean_mean_e_evolr = mean(mean_e_evolr),
+            mean_mean_v_evolr = mean(mean_v_evolr),
+            mean_mean_comm_evolr = mean(mean_comm_evolr),
+            mean_mean_e_fcij = mean(mean_e_fcij),
+            mean_mean_v_fcij = mean(mean_v_fcij),
+            mean_mean_comm_fcij = mean(mean_comm_fcij),
+            modularity = modularity[1],
+            NODF = NODF[1],
+            connectance = connectance[1])
+
+
+mod_er_e = ggplot(data = df_plot, aes(x = modularity, y = mean_mean_e_evolr)) +
+  geom_point(alpha = 0.3, size = 3, color = "#E69F00") +
+# geom_smooth(method = "gam", se = FALSE, color = "red") +
+  labs(x = "Modularity", y = expression(paste("Evolutionary rate ",italic((sigma))^2))) +
+  theme_classic()+
+  my_theme
+
+mod_er_v = ggplot(data = df_plot, aes(x = modularity, y = mean_mean_v_evolr)) +
+  geom_point(alpha = 0.3, size = 3, color = "#009E73") +
+# geom_smooth(method = "gam", se = FALSE, color = "red") +
+  labs(x = "Modularity", y = expression(paste("Evolutionary rate ",italic((sigma))^2))) +
+  theme_classic()+
+  my_theme
+
+mod_s_e = ggplot(data = df_plot, aes(x = modularity, y = mean_mean_e_fcij)) +
+  geom_point(alpha = 0.3, size = 3, color = "#E69F00") +
+# geom_smooth(method = "gam", se = FALSE, color = "red") +
+  labs(x = "Modularity", y = expression(paste("Trait matching fluctuation ",(italic(lambda))))) +
+  theme_classic()+
+  my_theme
+
+mod_s_v = ggplot(data = df_plot, aes(x = modularity, y = mean_mean_v_fcij)) +
+  geom_point(alpha = 0.3, size = 3, color = "#009E73") +
+# geom_smooth(method = "gam", se = FALSE, color = "red") +
+  labs(x = "Modularity", y = expression(paste("Trait matching fluctuation ",(italic(lambda))))) +
+  theme_classic()+
+  my_theme
+
+# Restructure the data for a combined plot
+df_combined <- df_plot %>%
+  select(modularity, mean_mean_e_fcij, mean_mean_v_fcij) %>%
+  pivot_longer(
+    cols = c(mean_mean_e_fcij, mean_mean_v_fcij),
+    names_to = "group",
+    values_to = "value"
+  ) %>%
+  mutate(group = recode(group, 
+                        mean_mean_e_fcij = "Exploiters", 
+                        mean_mean_v_fcij = "Victims"))
+
+mod_s_combined <- ggplot(df_combined, aes(x = modularity, y = value, color = group)) +
+  geom_point(alpha = 0.6, size = 3) +
+  labs(
+    x = "Modularity",
+    y = expression(paste("Trait matching fluctuation ", (italic(lambda)))),
+    color = NULL
+  ) +
+  scale_color_manual(values = c("Exploiters" = "#E69F00", "Victims" = "#009E73")) +
+  theme_classic() +
+  my_theme
+
+
+
+mod_er_matching = ggarrange(
+  
+  mod_er_e, mod_er_v,
+  mod_s_e, mod_s_v,
+  
+  labels = LETTERS[9:12],
+  
+  ncol = 4,
+  nrow = 1
+)
+
+
+```
+
+## distribution
+
+```{r}
+# Filter out the "random" distribution
+df_filtered <- df_replicates %>%
+  filter(distribution != "random" & complete.cases(mean_v_evolr) & !is.na(distribution))
+
+# Update the combined dataset for the last plot
+df_combined <- df_filtered %>%
+  select(distribution, mean_e_fcij, mean_v_fcij) %>%
+  pivot_longer(
+    cols = c(mean_e_fcij, mean_v_fcij),
+    names_to = "group",
+    values_to = "value"
+  ) %>%
+  mutate(group = recode(group, 
+                        mean_e_fcij = "Exploiters", 
+                        mean_v_fcij = "Victims"))
+
+# Recreate the plots without "random"
+dist_er_e <- ggplot(df_filtered, aes(x = distribution, y = mean_e_evolr, fill = distribution)) +
+  geom_violin() +
+  labs(x = NULL, y = expression(paste("Evolutionary rate ", italic((sigma))^2)), fill = "Distribution") +
+  scale_fill_manual(values = c("#E69F00", "#E69F00")) +
+  theme_classic() +
+  my_theme +
+  theme(legend.position = "none")
+
+dist_er_v <- ggplot(df_filtered, aes(x = distribution, y = mean_v_evolr, fill = distribution)) +
+  geom_violin() +
+  labs(x = NULL, y = expression(paste("Evolutionary rate ", italic((sigma))^2)), fill = "Distribution") +
+  scale_fill_manual(values = c("#009E73", "#009E73")) +
+  theme_classic() +
+  my_theme +
+  theme(legend.position = "none")
+
+dist_s_e <- ggplot(df_filtered, aes(x = distribution, y = mean_e_fcij, fill = distribution)) +
+  geom_violin() +
+  labs(x = NULL, y = expression(paste("Trait matching fluctuation ", (italic(lambda)))), fill = "Distribution") +
+  scale_fill_manual(values = c("#E69F00", "#E69F00")) +
+  theme_classic() +
+  my_theme +
+  theme(legend.position = "none")
+
+dist_s_v <- ggplot(df_filtered, aes(x = distribution, y = mean_v_fcij, fill = distribution)) +
+  geom_violin() +
+  labs(x = NULL, y = expression(paste("Trait matching fluctuation ", (italic(lambda)))), fill = "Distribution") +
+  scale_fill_manual(values = c("#009E73", "#009E73")) +
+  theme_classic() +
+  my_theme +
+  theme(legend.position = "none")
+
+dist_s_combined <- ggplot(df_combined, aes(x = distribution, y = value, fill = group)) +
+  geom_violin(position = position_dodge(width = 0.8)) +
+  labs(
+    x = NULL,
+    y = expression(paste("Trait matching fluctuation ", (italic(lambda)))),
+    fill = "Group"
+  ) +
+  scale_fill_manual(values = c("Exploiters" = "#E69F00", "Victims" = "#009E73")) +
+  theme_classic() +
+  my_theme
+
+# Arrange plots
+dist_er_matching <- ggarrange(
+  dist_er_e, dist_er_v,
+  dist_s_e, dist_s_v,
+  labels = LETTERS[13:16],
+  ncol = 4,
+  nrow = 1
+)
+
+
+
+
+```
+
+
+arranged plot evol and matching ~ structure
+
+```{r}
+
+# Wrap individual plots with legends on top
+panel_modnest_evolr_e <- ggarrange(plot_modnest_evolr_e, ncol = 1, nrow = 1)
+panel_modnest_evolr_v <- ggarrange(plot_modnest_evolr_v, ncol = 1, nrow = 1)
+panel_modnest_fcij_combined <- ggarrange(plot_modnest_fcij_combined, ncol = 1, nrow = 1)
+
+plot_er_s_str <- ggarrange(
+  s_er_e, s_er_v, s_s_combined,
+  c_er_e, c_er_v, c_s_combined,
+  panel_modnest_evolr_e, panel_modnest_evolr_v, panel_modnest_fcij_combined,
+  dist_er_e, dist_er_v, dist_s_combined,
+  ncol = 3,
+  nrow = 4,
+  common.legend = TRUE,
+  labels = LETTERS[1:12]
+)
+plot_er_s_str
+
+#ggsave(here::here("figures/fig_2_22june2025.png"), height = 14, width = 12)
+
+```
+
+
+
+
+# effects ~ structure
+
+
+```{r}
+df_replicates = df_replicates %>% 
+mutate(mean_evenness = sapply(evenness, mean))
+
+df_plot <- df_replicates %>% 
+  filter(test_metric == "nestedness") %>% 
+  select(nestedness, 
+         mean_evenness,
+         NODF,
+         modularity) %>%
+  group_by(nestedness) 
+
+
+plot_nest_H = ggplot(data = df_plot, aes(x = NODF, y = mean_evenness)) +
+  geom_point(alpha = 0.03, size = 3) +
+# geom_smooth(method = "gam", se = FALSE, color = "red") +
+  labs(x = "Nestedness", y = expression(paste("Biotic effects evennness ",italic((H[b]))))) +
+  theme_classic()+
+  my_theme
+
+
+plot_mod_H = ggplot(data = df_plot, aes(x = modularity, y = mean_evenness)) +
+  geom_point(alpha = 0.03, size = 3) +
+# geom_smooth(method = "gam", se = FALSE, color = "red") +
+  labs(x = "Modularity", y = expression(paste("Biotic effects evennness ",italic((H[b]))))) +
+  theme_classic()+
+  my_theme
+
+
+df_plot <- df_replicates %>% 
+  filter(test_metric == "connectance") %>% 
+  select(connectance, 
+         mean_evenness) %>%
+  group_by(connectance) 
+
+
+plot_c_H = ggplot(data = df_plot, aes(x = connectance, y = mean_evenness)) +
+  geom_point(alpha = 0.03, size = 3) +
+# geom_smooth(method = "gam", se = FALSE, color = "red") +
+  labs(x = "Connectance", y =expression(paste("Biotic effects evennness ",italic((H[b]))))) +
+  theme_classic()+
+  my_theme
+
+
+
+df_plot <- df_replicates %>%
+  filter(test_metric == "distribution", distribution != "random") %>% 
+  select(connectance, distribution, mean_evenness) %>%
+  group_by(distribution)
+
+# Create the updated plot_dist_H without "random"
+plot_dist_H <- ggplot(df_plot, aes(x = distribution, y = mean_evenness)) +
+  geom_violin(fill = "gray") +
+  labs(x = NULL, y = expression(paste("Biotic effects evenness ", italic((H[b]))))) +
+  theme_classic() +
+  theme(legend.position = "none") +
+  my_theme
+
+
+
+
+df_replicates <- df_replicates %>%
+  mutate(degree = map2(degree_v, degree_e, c))
+
+df_plot = data.frame("degree" = unlist(df_replicates$degree),
+                     "evenness" = unlist(df_replicates$evenness))
+
+plot_degree_H = ggplot(data = df_plot, aes(x = degree, y = evenness)) +
+  geom_point(alpha = 0.008, size = 1) +
+# geom_smooth(method = "gam", se = FALSE, color = "red") +
+  labs(x = "Species degree", y = expression(paste("Biotic effects evennness ",italic((H[b]))))) +
+  theme_classic()+
+  my_theme
+
+
+evenness_plots = ggarrange(
+  
+  plot_c_H,
+  plot_mod_H,
+  plot_dist_H,
+  plot_degree_H,
+  
+  ncol = 2,
+  nrow = 2,
+  
+  labels = LETTERS[1:4]
+  
+)
+
+evenness_plots
+
+#ggsave("../figures/supplmat/evenness_str_simulated_corrected.png", height = 8, width = 8)
+
+```
+
+
+```{r}
+df_replicates_random <- df_replicates[df_replicates$distribution == "random",] %>%
+  mutate(degree = map2(degree_v, degree_e, c))
+
+df_plot = data.frame("degree" = unlist(df_replicates_random$degree),
+                     "evenness" = unlist(df_replicates_random$evenness))
+
+plot_degree_H_random = ggplot(data = df_plot, aes(x = degree, y = evenness)) +
+  geom_point(alpha = 0.008, size = 1) +
+# geom_smooth(method = "gam", se = FALSE, color = "red") +
+  labs(x = "Species degree", y = expression(paste("Biotic effects evennness ",italic((H[b]))))) +
+  theme_classic()+
+  my_theme
+
+
+
+df_replicates_sf <- df_replicates[df_replicates$distribution == "scale-free",] %>%
+  mutate(degree = map2(degree_v, degree_e, c))
+
+df_plot = data.frame("degree" = unlist(df_replicates_sf$degree),
+                     "evenness" = unlist(df_replicates_sf$evenness))
+
+plot_degree_H_sf = ggplot(data = df_plot, aes(x = degree, y = evenness)) +
+  geom_point(alpha = 0.008, size = 1) +
+# geom_smooth(method = "gam", se = FALSE, color = "red") +
+  labs(x = "Species degree", y = expression(paste("Biotic effects evennness ",italic((H[b]))))) +
+  theme_classic()+
+  my_theme
+
+
+
+df_replicates_nest <- df_replicates[df_replicates$distribution == "nested",] %>%
+  mutate(degree = map2(degree_v, degree_e, c))
+
+df_plot = data.frame("degree" = unlist(df_replicates_nest$degree),
+                     "evenness" = unlist(df_replicates_nest$evenness))
+
+plot_degree_H_nest = ggplot(data = df_plot, aes(x = degree, y = evenness)) +
+  geom_point(alpha = 0.008, size = 1) +
+# geom_smooth(method = "gam", se = FALSE, color = "red") +
+  labs(x = "Species degree", y = expression(paste("Biotic effects evennness ",italic((H[b]))))) +
+  theme_classic()+
+  my_theme
+
+
+plot_degree_h_dist = ggarrange(
+  
+  plot_degree_H_random,
+  plot_degree_H_sf,
+  plot_degree_H_nest,
+  
+  labels = LETTERS[1:3],
+  
+  ncol = 3,
+  nrow = 1
+  
+)
+
+plot_degree_h_dist
+
+#ggsave("../figures/supplmat/plot_degree_h_dist.png", height = 5, width = 12)
+
+```
+
+
+
+
+# FIGURE 1
+
+
+```{r}
+plot_complexity_effects <- readRDS(here::here("figures/plot_complexity_effects.rds"))
+p_mod_nest_effects <- readRDS(here::here("figures/p_mod_nest_effects.rds"))
+plot_degree_effects <- readRDS(here::here("figures/plot_degree_effects.rds"))
+
+
+fig_1 <- ggarrange(
+  
+  plot_c_H, 
+  plot_mod_H, 
+  plot_dist_H,
+  plot_complexity_effects,
+  p_mod_nest_effects,
+  plot_degree_effects,
+  ncol = 3,
+  nrow = 2,
+  common.legend = TRUE,
+  labels = LETTERS[1:6],
+  legend = "bottom")
+
+fig_1
+
+#ggsave("../figures/fig_1.png", height = 9, width = 11)
+```
+
+
+
+# adaptation ~ structure
+
+
+```{r}
+
+# RICHNESS
+
+
+df_plot <- df_replicates %>% 
+  filter(test_metric == "richness") %>% 
+  select(connectance, n,
+         mean_e_load_abiot,
+         mean_e_load_biot,
+         mean_e_load_network,
+         mean_v_load_abiot,
+         mean_v_load_biot,
+         mean_v_load_network,
+         NODF,
+         modularity) %>%
+  group_by(n) %>%
+  summarize(mean_mean_e_load_abiot = mean(mean_e_load_abiot),
+            mean_mean_e_load_biot = mean(mean_e_load_biot),
+            mean_mean_e_load_network = mean(mean_e_load_network),
+            mean_mean_v_load_abiot = mean(mean_v_load_abiot),
+            mean_mean_v_load_biot = mean(mean_v_load_biot),
+            mean_mean_v_load_network = mean(mean_v_load_network),
+            modularity = modularity[1],
+            NODF = NODF[1],
+            connectance[1])
+
+
+s_adapt_e = ggplot(data = df_plot, aes(x = mean_mean_e_load_abiot, y = mean_mean_e_load_biot)) +
+  geom_point(aes(color = n), alpha = 0.5, size = 4) +
+# geom_smooth(method = "gam", se = FALSE, color = "red") +
+  labs(x = expression(paste("abiotic load ", italic((L[alpha])))), y = expression(paste("biotic load ", italic((L[beta]))))) +
+scale_color_viridis_c(name = "Species richness", option = "turbo") +
+  scale_y_continuous(labels = back_transform_sqrt)+
+  theme_classic()+
+  theme(legend.position = "top",
+        legend.key.size = unit(0.5, "cm"))+
+    my_theme
+
+
+s_adapt_v = ggplot(data = df_plot, aes(x = mean_mean_v_load_abiot, y = mean_mean_v_load_biot)) +
+  geom_point(aes(color = n), alpha = 0.5, size = 4, shape = "triangle") +
+# geom_smooth(method = "gam", se = FALSE, color = "red") +
+  labs(x = expression(paste("abiotic load ", italic((L[alpha])))), y = expression(paste("biotic load ", italic((L[beta]))))) +
+scale_color_viridis_c(name = "Species richness", option = "turbo") +
+  scale_y_continuous(labels = back_transform_sqrt)+
+  theme_classic()+
+  theme(legend.position = "top",
+        legend.key.size = unit(0.5, "cm"))+
+    my_theme
+
+
+# CONNECTANCE
+
+
+df_plot <- df_replicates %>% 
+  filter(test_metric == "connectance") %>% 
+  select(connectance, n,
+         mean_e_load_abiot,
+         mean_e_load_biot,
+         mean_e_load_network,
+         mean_v_load_abiot,
+         mean_v_load_biot,
+         mean_v_load_network,
+         NODF,
+         modularity) %>%
+  group_by(connectance) %>%
+  summarize(mean_mean_e_load_abiot = mean(mean_e_load_abiot),
+            mean_mean_e_load_biot = mean(mean_e_load_biot),
+            mean_mean_e_load_network = mean(mean_e_load_network),
+            mean_mean_v_load_abiot = mean(mean_v_load_abiot),
+            mean_mean_v_load_biot = mean(mean_v_load_biot),
+            mean_mean_v_load_network = mean(mean_v_load_network),
+            modularity = modularity[1],
+            NODF = NODF[1],
+            connectance[1])
+
+
+c_adapt_e = ggplot(data = df_plot, aes(x = mean_mean_e_load_abiot, y = mean_mean_e_load_biot)) +
+  geom_point(aes(color = connectance), alpha = 0.5, size = 4) +
+# geom_smooth(method = "gam", se = FALSE, color = "red") +
+  labs(x = expression(paste("abiotic load ", italic((L[alpha])))), y = expression(paste("biotic load ", italic((L[beta]))))) +
+scale_color_viridis_c(name = expression(italic(C)), option = "turbo") +
+  scale_y_continuous(labels = back_transform_sqrt)+
+  theme_classic()+
+  theme(legend.position = "top",
+        legend.key.size = unit(0.5, "cm"))+
+    my_theme
+
+
+c_adapt_v = ggplot(data = df_plot, aes(x = mean_mean_v_load_abiot, y = mean_mean_v_load_biot)) +
+  geom_point(aes(color = connectance), alpha = 0.5, size = 4, shape = "triangle") +
+# geom_smooth(method = "gam", se = FALSE, color = "red") +
+  labs(x = expression(paste("abiotic load ", italic((L[alpha])))), y = expression(paste("biotic load ", italic((L[beta]))))) +
+scale_color_viridis_c(name = expression(italic(C)), option = "turbo") +
+  scale_y_continuous(labels = back_transform_sqrt)+
+  theme_classic()+
+  theme(legend.position = "top",
+        legend.key.size = unit(0.5, "cm"))+
+    my_theme
+
+
+
+# MODULARITY
+
+
+df_plot <- df_replicates %>% 
+  filter(test_metric == "nestedness") %>% 
+  select(nestedness,connectance, n,
+         mean_e_load_abiot,
+         mean_e_load_biot,
+         mean_e_load_network,
+         mean_v_load_abiot,
+         mean_v_load_biot,
+         mean_v_load_network,
+         NODF,
+         modularity) %>%
+  group_by(nestedness) %>%
+  summarize(mean_mean_e_load_abiot = mean(mean_e_load_abiot),
+            mean_mean_e_load_biot = mean(mean_e_load_biot),
+            mean_mean_e_load_network = mean(mean_e_load_network),
+            mean_mean_v_load_abiot = mean(mean_v_load_abiot),
+            mean_mean_v_load_biot = mean(mean_v_load_biot),
+            mean_mean_v_load_network = mean(mean_v_load_network),
+            modularity = modularity[1],
+            NODF = NODF[1],
+            connectance[1])
+
+
+mod_adapt_e = ggplot(data = df_plot, aes(x = mean_mean_e_load_abiot, y = mean_mean_e_load_biot)) +
+  geom_point(aes(color = modularity), alpha = 0.5, size = 4) +
+# geom_smooth(method = "gam", se = FALSE, color = "red") +
+  labs(x = expression(paste("abiotic load ", italic((L[alpha])))), y = expression(paste("biotic load ", italic((L[beta]))))) +
+scale_color_viridis_c(name = "modularity", option = "turbo") +
+  scale_y_continuous(labels = back_transform_sqrt)+
+  theme_classic()+
+  theme(legend.position = "top",
+        legend.key.size = unit(0.5, "cm"))+
+    my_theme
+
+
+mod_adapt_v = ggplot(data = df_plot, aes(x = mean_mean_v_load_abiot, y = mean_mean_v_load_biot)) +
+  geom_point(aes(color = modularity), alpha = 0.5, size = 4, shape = "triangle") +
+# geom_smooth(method = "gam", se = FALSE, color = "red") +
+  labs(x = expression(paste("abiotic load ", italic((L[alpha])))), y = expression(paste("biotic load ", italic((L[beta]))))) +
+scale_color_viridis_c(name = "modularity", option = "turbo") +
+  scale_y_continuous(labels = back_transform_sqrt)+
+  theme_classic()+
+  theme(legend.position = "top",
+        legend.key.size = unit(0.5, "cm"))+
+    my_theme
+
+
+
+# DSITRIBUTION
+
+
+df_plot <- df_replicates %>% 
+  filter(test_metric == "distribution") %>% 
+  select(distribution,nestedness,connectance, n,
+         mean_e_load_abiot,
+         mean_e_load_biot,
+         mean_e_load_network,
+         mean_v_load_abiot,
+         mean_v_load_biot,
+         mean_v_load_network,
+         NODF,
+         modularity) %>%
+  group_by(distribution) %>%
+  summarize(mean_mean_e_load_abiot = mean(mean_e_load_abiot),
+            mean_mean_e_load_biot = mean(mean_e_load_biot),
+            mean_mean_e_load_network = mean(mean_e_load_network),
+            mean_mean_v_load_abiot = mean(mean_v_load_abiot),
+            mean_mean_v_load_biot = mean(mean_v_load_biot),
+            mean_mean_v_load_network = mean(mean_v_load_network),
+            modularity = modularity[1],
+            NODF = NODF[1],
+            connectance[1])
+
+
+df_filtered <- df_replicates[complete.cases(df_replicates$mean_v_evolr) & !is.na(df_replicates$distribution), ]
+
+
+dist_adapt_e = ggplot(data = df_filtered, aes(x = mean_e_load_abiot, y = mean_e_load_biot)) +
+  geom_point(aes(color = distribution), alpha = 0.1, size = 4) +
+# geom_smooth(method = "gam", se = FALSE, color = "red") +
+  labs(x = expression(paste("abiotic load ", italic((L[alpha])))), y = expression(paste("biotic load ", italic((L[beta]))))) +
+scale_color_manual(values = c("gray", "#0072B2", "#CC79A7")) +
+  scale_y_continuous(labels = back_transform_sqrt)+
+  theme_classic()+
+    my_theme
+
+
+dist_adapt_v = ggplot(data = df_filtered, aes(x = mean_v_load_abiot, y = mean_v_load_biot)) +
+  geom_point(aes(color = distribution), alpha = 0.1, size = 4, shape = "triangle") +
+# geom_smooth(method = "gam", se = FALSE, color = "red") +
+  labs(x = expression(paste("abiotic load ", italic((L[alpha])))), y = expression(paste("biotic load ", italic((L[beta]))))) +
+scale_color_manual(values = c("gray", "#0072B2", "#CC79A7")) +
+  scale_y_continuous(labels = back_transform_sqrt)+
+  theme_classic()+
+    my_theme
+
+
+
+
+s_adapt_str = ggarrange(
+  
+  s_adapt_e, s_adapt_v,
+  
+  ncol = 2,
+  nrow = 1,
+  
+  common.legend = TRUE,
+  
+    legend = "right",
+  
+  labels = LETTERS[1:2]
+)
+
+
+
+c_adapt_str = ggarrange(
+  
+  c_adapt_e, c_adapt_v,
+  
+  ncol = 2,
+  nrow = 1,
+  
+  common.legend = TRUE,
+  
+    legend = "right",
+  
+  labels = LETTERS[3:4]
+)
+
+mod_adapt_str = ggarrange(
+  
+  mod_adapt_e, mod_adapt_v,
+  
+  ncol = 2,
+  nrow = 1,
+  
+  common.legend = TRUE,
+  
+    legend = "right",
+  
+  labels = LETTERS[5:6]
+)
+
+
+dist_adapt_str = ggarrange(
+  
+  dist_adapt_e, dist_adapt_v,
+  
+  ncol = 2,
+  nrow = 1,
+  
+  common.legend = TRUE,
+  
+  legend = "right",
+  
+  labels = LETTERS[7:8]
+)
+
+
+
+
+plot_adapt_str = ggarrange(
+ 
+  s_adapt_str,
+  c_adapt_str,
+  mod_adapt_str,
+  dist_adapt_str,
+  
+  ncol = 1,
+  nrow = 4
+  
+  
+)
+
+plot_adapt_str
+
+#ggsave("../figures/supplmat/adapt_str_simulated_corrected.png", height = 12, width = 9)
+
+
+```
+
+
+
+Network load:
+
+```{r}
+
+# RICHNESS
+
+df_plot <- df_replicates %>% 
+  filter(test_metric == "richness") %>% 
+  select(connectance, n,
+         mean_comm_load_network,
+         NODF,
+         modularity) %>%
+  group_by(n) %>%
+  summarize(mean_mean_comm_load_network = mean(mean_comm_load_network),
+            modularity = modularity[1],
+            NODF = NODF[1],
+            connectance[1])
+
+s_adapt3rd = ggplot(data = df_plot, aes(x = n, y = mean_mean_comm_load_network)) +
+  geom_point(alpha = 0.5, size = 4) +
+# geom_smooth(method = "gam", se = FALSE, color = "red") +
+  labs(x = "Species richness", y = expression(paste("network load ", italic((L[gamma]))))) +
+  scale_y_continuous(labels = back_transform_sqrt)+
+  theme_classic()+
+    my_theme
+
+
+# CONNECTANCE
+
+df_plot <- df_replicates %>% 
+  filter(test_metric == "connectance") %>% 
+  select(connectance, n,
+         mean_comm_load_network,
+         NODF,
+         modularity) %>%
+  group_by(connectance) %>%
+  summarize(mean_mean_comm_load_network = mean(mean_comm_load_network),
+            modularity = modularity[1],
+            NODF = NODF[1],
+            connectance[1])
+
+c_adapt3rd = ggplot(data = df_plot, aes(x = connectance, y = mean_mean_comm_load_network)) +
+  geom_point(alpha = 0.5, size = 4) +
+# geom_smooth(method = "gam", se = FALSE, color = "red") +
+  labs(x = expression(italic(C)), y = expression(paste("network load ", italic((L[gamma]))))) +
+  scale_y_continuous(labels = back_transform_sqrt)+
+  theme_classic()+
+    my_theme
+
+
+# MODULARITY
+
+df_plot <- df_replicates %>% 
+  filter(test_metric == "nestedness") %>% 
+  select(connectance, n,
+         mean_comm_load_network,
+         NODF,
+         modularity) %>%
+  group_by(modularity) %>%
+  summarize(mean_mean_comm_load_network = mean(mean_comm_load_network),
+            modularity = modularity[1],
+            NODF = NODF[1],
+            connectance[1])
+
+mod_adapt3rd = ggplot(data = df_plot, aes(x = modularity, y = mean_mean_comm_load_network)) +
+  geom_point(alpha = 0.5, size = 4) +
+# geom_smooth(method = "gam", se = FALSE, color = "red") +
+  labs(x = "modularity", y = expression(paste("network load ", italic((L[gamma]))))) +
+  scale_y_continuous(labels = back_transform_sqrt)+
+  theme_classic()+
+    my_theme
+
+
+
+# DISTRIBUTION
+
+df_plot <- df_replicates %>% 
+  filter(test_metric == "distribution") %>% 
+  select(distribution,connectance, n,
+         mean_comm_load_network,
+         NODF,
+         modularity) %>%
+  group_by(distribution) %>%
+  summarize(mean_mean_comm_load_network = mean(mean_comm_load_network),
+            modularity = modularity[1],
+            NODF = NODF[1],
+            connectance[1])
+
+dist_adapt3rd = ggplot(data = df_filtered, aes(x = distribution, y = mean_comm_load_network)) +
+  geom_violin() +
+# geom_smooth(method = "gam", se = FALSE, color = "red") +
+  labs(x = NULL, y = expression(paste("network load ", italic((L[gamma]))))) +
+   scale_fill_manual(values = c("gray", "gray30", "black"))+
+  scale_y_continuous(labels = back_transform_sqrt)+
+  theme_classic()+
+    my_theme
+
+
+p_3rdterm_str = ggarrange(
+  
+  
+  s_adapt3rd,
+  c_adapt3rd,
+  mod_adapt3rd,
+  dist_adapt3rd,
+  
+  ncol = 2,
+  nrow = 2,
+  
+  labels = LETTERS[1:4]
+  
+  
+)
+
+p_3rdterm_str
+
+#ggsave("../figures/supplmat/3rdterm_simstr_corrected.png", height = 8, width = 8)
+
+
+```
+

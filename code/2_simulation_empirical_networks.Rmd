@@ -1,0 +1,1323 @@
+---
+title: "Coevolution simulation using empirical networks"
+---
+
+This script runs coevolutionary simulations on each empirical network and generates figures illustrating the relationships between network structural properties and measures of coevolution.
+
+The simulation includes an option to introduce abiotic perturbations by shifting species' environmental optima. These perturbation scenarios were not used in the article **Trapped in the web: network architectures spread coevolution and shape adaptation**. The simulation function includes an argument that controls whether such perturbations are applied and is currently set to exclude them.
+
+
+```{r}
+library(tidyverse)
+library(ggplot2)
+library(reshape2)
+library(tidyr)
+library(dplyr)
+library(ggpubr)
+library(viridis)
+library(grid)
+library(bipartite) # to use the networklevel() function to calculate modularity and nestedness
+library(igraph)
+
+# Custom functions
+
+source("Functions.R")
+source("load_computation.R")
+```
+
+
+
+## prepare scenarios' dataframe
+
+Read empirical networks table
+
+```{r}
+
+df_network_metrics <- readRDS(here::here("output/df_network_metrics.rds"))
+
+df_network_metrics <- df_network_metrics %>%  # rename column with network names
+  rename(id_network = network.file)
+
+head(df_network_metrics)
+```
+
+
+
+*Make dataframe*:
+
+
+```{r}
+nrepl <- 20
+
+# Create combinations of scenarios based on network and perturbation
+df_scenarios <- expand.grid(id_network = df_network_metrics$id_network)
+
+# Generate 10 replicates for each scenario
+df_replicates <- df_scenarios %>%
+  mutate(scenario = row_number()) %>%
+  tidyr::crossing(replicate = 1:nrepl) %>%
+  arrange(scenario, replicate) 
+
+# Print or use df_replicates as needed
+head(df_replicates)
+
+```
+
+
+
+## set storing objects
+
+```{r}
+
+df_replicates <- df_replicates %>% 
+  mutate(
+  
+  
+# trait values at equilibrium
+    
+traits_eq = vector("list", nrow(df_replicates)),
+traits_eq_push1 = vector("list", nrow(df_replicates)),
+traits_eq_push2 = vector("list", nrow(df_replicates)),
+teta = vector("list", nrow(df_replicates)),
+
+
+
+# evolutionary rate
+
+comm_evolr = vector("list", nrow(df_replicates)),
+v_evolr = vector("list", nrow(df_replicates)),
+e_evolr = vector("list", nrow(df_replicates)),
+
+
+# mean fluctuation in trait matching
+
+comm_fcij = vector("list", nrow(df_replicates)),
+v_fcij = vector("list", nrow(df_replicates)),
+e_fcij = vector("list", nrow(df_replicates)),
+    
+
+# mean fitness load
+
+comm_load_total = vector("list", nrow(df_replicates)),
+comm_load_biot = vector("list", nrow(df_replicates)),
+comm_load_abiot = vector("list", nrow(df_replicates)),
+comm_load_network = vector("list", nrow(df_replicates)),
+
+v_load_total = vector("list", nrow(df_replicates)),
+v_load_biot = vector("list", nrow(df_replicates)),
+v_load_abiot = vector("list", nrow(df_replicates)),
+v_load_network = vector("list", nrow(df_replicates)),
+
+e_load_total = vector("list", nrow(df_replicates)),
+e_load_biot = vector("list", nrow(df_replicates)),
+e_load_abiot = vector("list", nrow(df_replicates)),
+e_load_network = vector("list", nrow(df_replicates)),
+
+
+)
+
+
+df_replicates$id_network <- as.character(df_replicates$id_network)
+df_replicates <- as.data.frame(df_replicates)
+
+head(df_replicates)
+
+```
+
+
+
+## create dataframes for perturbation scenarios
+
+```{r}
+df_replicates_pert1 = df_replicates 
+df_replicates_pert1$time_to_equilibrium <- numeric(nrow(df_replicates_pert1))
+df_replicates_pert2 = df_replicates 
+df_replicates_pert2$time_to_equilibrium <- numeric(nrow(df_replicates_pert2))
+```
+
+
+## set fixed parameters
+
+```{r}
+
+nsims <- 300
+her <- 0.22 # heritability
+e <- 0.5 # # e (epsilon trait distance)
+b <- 10 # b (b expoent exploiter preference)
+
+
+# Set values of biotic selection
+
+bio_sel_v<-0.16
+bio_sel_e<-0.16
+
+ksi_hosts<-1-bio_sel_v
+ksi_exploiters<- 1-bio_sel_e
+
+
+# simulate perturbations?
+
+simulate_perturbation1 = "no"
+simulate_perturbation2 = "no"
+
+# number of push steps
+
+T_push <- 15
+delta_teta <- 0.2
+max_attempts <- 30 # max. number of attempts to find an equilibrium
+
+```
+
+
+
+# Simulation
+
+
+```{r}
+set.seed(1000)
+
+for (sc in 1:nrow(df_replicates)) {
+  print(paste(sprintf("Right now I am doing iteration %s", sc), "of", nrow(df_replicates)))
+  
+  # Get the network
+  binary.matrix <- unname(as.matrix(df_network_metrics[df_network_metrics$id_network == df_replicates[sc, "id_network"], "list_networks"][[1]]))
+  bigmat.F <- create_F(binary.matrix)
+  
+  # Set the number of species
+  n.host <- nrow(binary.matrix)
+  n.exploiter <- ncol(binary.matrix)
+  nsp <- n.host + n.exploiter
+  
+  # Initialize simulation parameters
+  ksi <- c(rep(ksi_hosts, n.host), rep(ksi_exploiters, n.exploiter))  # Strength of abiotic selection
+  max_stable_timesteps <- 20  # Equilibrium condition
+  equilibrium_reached <- FALSE  # Flag for equilibrium
+  
+attempt <- 0 # attempts for finding an equilibrium
+  ### Equilibrium in Normal Conditions ###
+  while (!equilibrium_reached && attempt < max_attempts) {
+    attempt <- attempt + 1
+    # Initialize matrices for traits and changes at the start of each attempt
+    trait <- matrix(0, nrow = nsims, ncol = nsp)  # Trait values for each timestep
+    z.change <- matrix(0, nrow = nsims, ncol = nsp)  # Trait changes for each timestep
+    trait[1, ] <- rnorm(nsp, mean = 0, sd = 0.1)  # Initial random trait values
+    teta <- trait[1, ]  # Environmental optima
+    cummulative.matching.change <- matrix(0, nrow = n.host, ncol = n.exploiter)
+    df_replicates$teta[[sc]] <- teta  # Save initial teta
+    stable_timesteps <- 0  # Reset stable timesteps count
+    stable_timesteps <- 0
+    
+    for (sim in 1:(nsims - 1)) {
+      
+      # Create matrix of differences in trait values for those species that interact
+      a.matrix <- create_a_matrix(trait_vec = trait[sim, ], Fmat = bigmat.F)
+      
+      #Calculate env.sel for each sp
+      E <- ksi * (teta - trait[sim, ])
+      
+      # Calculate interaction selection for victims & store it in vector Rh, and for exploiters in vetor Rp
+      Rh <- calc_Rh_corrected(a_matrix = a.matrix, big_mat = bigmat.F, KSI.b = bio_sel_v, n_host = n.host, e_threshold = e)
+      Rp <- calc_Rp_corrected(a_matrix = a.matrix, big_mat = bigmat.F, KSI.b = bio_sel_e, B = b, n_host = n.host, n_exploiter = n.exploiter, nsp = nsp)
+      R <- c(Rh, Rp)
+      
+      # Compute Trait evolution
+      z.change[sim, ] <- her * (R + E)
+      trait[sim + 1, ] <- trait[sim, ] + z.change[sim, ]
+      
+      # Update a.matrix
+      dif.traits2 <- outer(trait[sim+1,], trait[sim+1,], FUN= "-") 
+      a.matrixsim2 <- bigmat.F*dif.traits2 
+      
+      # Calculate change in trait matching with time
+      matching.change.matrix <- a.matrixsim2[1:n.host, (n.host+1):nsp] -a.matrix[1:n.host, (n.host+1):nsp]
+      cummulative.matching.change <- cummulative.matching.change + abs(matching.change.matrix)
+      
+      # Check for equilibrium
+      if (sim >= max_stable_timesteps && isTRUE(all.equal(trait[sim, ], trait[sim - max_stable_timesteps + 1, ], tolerance = 1e-10))) {
+        stable_timesteps <- stable_timesteps + 1
+        if (stable_timesteps >= max_stable_timesteps) {
+          equilibrium_reached <- TRUE
+          message("Equilibrium reached at timestep ", sim)
+          df_replicates$traits_eq[[sc]] <- trait[sim, ]
+          break
+        }
+      } else {
+        stable_timesteps <- 0
+      }
+    }
+    if (!equilibrium_reached) message("Restarting simulation: equilibrium not reached.")
+  }
+  
+  if (!equilibrium_reached) {
+  message("normal scenario - Skipping to the next iteration after ", max_attempts, " attempts.")
+  next
+}
+  
+  
+  
+  ################ store results
+  
+  # Evolutionary rate
+  df_replicates$comm_evolr[[sc]] <- colSums(abs(z.change))/nsims
+  df_replicates$v_evolr[[sc]] <- colSums(abs(z.change[,1:n.host]))/nsims
+  df_replicates$e_evolr[[sc]]  <- colSums(abs(z.change[,(n.host+1):nsp]))/nsims
+  
+  # mean fluctuation in trait matching
+  df_replicates$v_fcij[[sc]] <-rowSums(cummulative.matching.change)
+  df_replicates$e_fcij[[sc]] <- colSums(cummulative.matching.change)
+  df_replicates$comm_fcij[[sc]] <- c(rowSums(cummulative.matching.change), colSums(cummulative.matching.change))
+  
+  # fitness load
+  
+# --- Victims
+simv_load_total <- numeric(n.host)
+simv_load_abiot <- numeric(n.host)
+simv_load_biot  <- numeric(n.host)
+
+for (v in 1:n.host) {
+  # Filter partners by interaction matrix
+  interacting_exploiters <- which(binary.matrix[v, ] == 1)  # Get indices of interacting exploiters
+  x_partners <- trait[sim, n.host + interacting_exploiters]  # Traits of interacting exploiters
+  
+  fitness_load <- fitness_load_victims(
+    x_s = trait[sim, v],
+    x_0 = teta[v],
+    x_partners = x_partners,  # Only interacting exploiters
+    epsilon = e  # Pass interaction threshold
+  )
+  
+  simv_load_total[v] <- fitness_load$load
+  simv_load_abiot[v] <- fitness_load$abiotic_L
+  simv_load_biot[v] <- fitness_load$biotic_L
+}
+
+df_replicates$v_load_total[[sc]] <- simv_load_total
+df_replicates$v_load_abiot[[sc]] <- simv_load_abiot
+df_replicates$v_load_biot[[sc]] <- simv_load_biot
+
+# --- Exploiters
+sime_load_total   <- numeric(n.exploiter)
+sime_load_abiot   <- numeric(n.exploiter)
+sime_load_biot    <- numeric(n.exploiter)
+sime_load_network <- numeric(n.exploiter)
+
+for (p in (n.host + 1):nsp) {
+  col_in_bin <- p - n.host                 
+  hosts <- which(binary.matrix[, col_in_bin] == 1)
+
+  if (length(hosts) == 0) {
+    # no partners: only abiotic matters
+    abi <- (trait[sim, p] - teta[p])^2
+    sime_load_total[col_in_bin]   <- abi
+    sime_load_abiot[col_in_bin]   <- abi
+    sime_load_biot[col_in_bin]    <- 0
+    sime_load_network[col_in_bin] <- 0
+    next
+  }
+
+  x_partners <- trait[sim, hosts]         
+
+  fl <- fitness_load_exploiters(
+    x_s        = trait[sim, p],
+    x_0        = teta[p],
+    x_partners = x_partners
+  )
+
+  sime_load_total[col_in_bin]   <- fl$load
+  sime_load_abiot[col_in_bin]   <- fl$abiotic_L
+  sime_load_biot[col_in_bin]    <- fl$biotic_L
+  sime_load_network[col_in_bin] <- fl$network_L
+}
+
+
+df_replicates$e_load_total[[sc]] <- sime_load_total
+df_replicates$e_load_abiot[[sc]] <- sime_load_abiot
+df_replicates$e_load_biot[[sc]] <- sime_load_biot
+df_replicates$e_load_network[[sc]] <- sime_load_network
+  
+  
+  #############
+  teta_eq_unperturbed <- teta
+  #############
+  
+  
+  ########################
+  # PUSH PERTURBATION
+  ########################
+  
+  ### Perturbation Scenarios ###
+  
+  if (simulate_perturbation1 == "yes") {
+    
+    # Initialize results
+  mean_time_to_equilibrium <- 0
+  time_to_equilibrium_steps <- numeric(T_push)
+  final_traits <- NULL
+  
+  # Initialize theta and traits from previous equilibrium
+  teta <- teta_eq_unperturbed
+  trait <- matrix(0, nrow = nsims, ncol = nsp)  # Store trait evolution
+  z.change <- matrix(0, nrow = nsims, ncol = nsp)  # Store trait changes
+  trait[1, ] <- df_replicates$traits_eq[[sc]]  # Traits from previous equilibrium
+  cummulative.matching.change <- matrix(0, nrow=n.host, ncol=n.exploiter)
+  
+  
+  for (step in 1:T_push) {
+    
+    # Gradual change in theta for hosts
+    teta[1:n.host] <- teta[1:n.host] + delta_teta
+    
+    # Reset for equilibrium finding
+    equilibrium_reached <- FALSE
+    step_time <- 0
+    stable_timesteps <- 0
+    
+    attempt <- 0 # attempts for finding an equilibrium
+    while (!equilibrium_reached && attempt < max_attempts) {
+      attempt <- attempt + 1
+      
+      # Reset the trait dynamics for this step
+      z.change <- matrix(0, nrow = nsims, ncol = nsp)
+      cummulative.matching.change <- matrix(0, nrow = n.host, ncol = n.exploiter)
+      
+      
+      for (sim in 1:(nsims - 1)) {
+        
+        
+        # Compute trait dynamics
+        
+        # Create matrix of differences in trait values for those species that interact
+        a.matrix <- create_a_matrix(trait_vec = trait[sim, ], Fmat = bigmat.F)
+        E <- ksi * (teta - trait[sim, ])
+        
+        # Calculate interaction selection for victims & store it in vector Rh, and for exploiters in vetor Rp
+        Rh <- calc_Rh_corrected(a_matrix = a.matrix, big_mat = bigmat.F, KSI.b = bio_sel_v, n_host = n.host, e_threshold = e)
+        Rp <- calc_Rp_corrected(a_matrix = a.matrix, big_mat = bigmat.F, KSI.b = bio_sel_e, B = b, n_host = n.host, n_exploiter = n.exploiter, nsp = nsp)
+        R <- c(Rh, Rp)
+        
+        # Compute Trait evolution
+        z.change[sim, ] <- her * (R + E)
+        trait[sim + 1, ] <- trait[sim, ] + z.change[sim, ]
+        
+        # Update a.matrix
+      dif.traits2 <- outer(trait[sim+1,], trait[sim+1,], FUN= "-") 
+      a.matrixsim2 <- bigmat.F*dif.traits2 
+      
+      # Calculate change in trait matching with time
+      matching.change.matrix <- a.matrixsim2[1:n.host, (n.host+1):nsp] -a.matrix[1:n.host, (n.host+1):nsp]
+        cummulative.matching.change <- cummulative.matching.change + abs(matching.change.matrix)
+        
+        
+        # Check for equilibrium
+        if (sim >= max_stable_timesteps && isTRUE(all.equal(trait[sim, ], trait[sim - max_stable_timesteps + 1, ], tolerance = 1e-10))) {
+          stable_timesteps <- stable_timesteps + 1
+          if (stable_timesteps >= max_stable_timesteps) {
+            equilibrium_reached <- TRUE
+            step_time <- sim
+            final_traits <- trait[sim, ]
+            break
+          }
+        } else {
+          stable_timesteps <- 0
+        }
+        
+      }
+      if (!equilibrium_reached) message("Restarting push perturbation step: equilibrium not reached.")
+    }
+    
+    
+    # Store time to equilibrium for this step
+    time_to_equilibrium_steps[step] <- step_time
+  
+  }
+  
+  if (!equilibrium_reached) {
+  message("perturbation 1 - Skipping to the next iteration after ", max_attempts, " attempts.")
+  next
+}
+    
+  
+  
+  
+  
+  ################ store results
+  
+
+  # Calculate mean time to equilibrium across all steps
+  mean_time_to_equilibrium <- mean(time_to_equilibrium_steps)
+
+  # Store final results
+  df_replicates_pert1$mean_time_to_equilibrium[[sc]] <- mean_time_to_equilibrium
+  df_replicates_pert1$traits_eq_push1[[sc]] <- final_traits
+  
+  
+  
+  # Evolutionary rate
+    df_replicates_pert1$comm_evolr[[sc]] <- colSums(abs(z.change))/nsims
+    df_replicates_pert1$v_evolr[[sc]] <- colSums(abs(z.change[,1:n.host, drop=FALSE]))/nsims
+    df_replicates_pert1$e_evolr[[sc]]  <- colSums(abs(z.change[,(n.host+1):nsp, drop=FALSE]))/nsims
+    
+    # mean fluctuation in trait matching
+    df_replicates_pert1$v_fcij[[sc]] <-rowSums(cummulative.matching.change)
+    df_replicates_pert1$e_fcij[[sc]] <- colSums(cummulative.matching.change)
+    df_replicates_pert1$comm_fcij[[sc]] <- c(rowSums(cummulative.matching.change), colSums(cummulative.matching.change))
+    
+    # fitness load
+    
+    
+    # --- Victims
+    simv_load_total <- numeric(length(n.host))
+    simv_load_abiot <- numeric(length(n.host))
+    simv_load_biot <- numeric(length(n.host))
+    
+    for (v in 1:n.host) {
+  # Filter partners by interaction matrix
+  interacting_exploiters <- which(binary.matrix[v, ] == 1)  # Get indices of interacting exploiters
+  x_partners <- trait[sim, n.host + interacting_exploiters]  # Traits of interacting exploiters
+  
+  fitness_load <- fitness_load_victims(
+    x_s = trait[sim, v],
+    x_0 = teta[v],
+    x_partners = x_partners,  # Only interacting exploiters
+    epsilon = e  # Pass interaction threshold
+  )
+  
+  simv_load_total[v] <- fitness_load$load
+  simv_load_abiot[v] <- fitness_load$abiotic_L
+  simv_load_biot[v] <- fitness_load$biotic_L
+}
+    
+    df_replicates_pert1$v_load_total[[sc]] <- simv_load_total
+    df_replicates_pert1$v_load_abiot[[sc]] <- simv_load_abiot
+    df_replicates_pert1$v_load_biot[[sc]] <- simv_load_biot
+    
+    # --- Exploiters
+    sime_load_total <- numeric(length(n.host))
+    sime_load_abiot <- numeric(length(n.host))
+    sime_load_biot <- numeric(length(n.host))
+    sime_load_network <- numeric(length(n.host))
+    index <- 1
+    
+    for (e in (n.host + 1):nsp) {
+      fitness_load <- fitness_load_exploiters(
+        x_s = trait[sim, e],
+        x_0 = teta[e],
+        x_partners = abs(a.matrix[, e])
+      )
+      
+      sime_load_total[index] <- fitness_load$load
+      sime_load_abiot[index] <- fitness_load$abiotic_L
+      sime_load_biot[index] <- fitness_load$biotic_L
+      sime_load_network[index] <- fitness_load$network_L
+      index <- index + 1
+    }
+    
+    df_replicates_pert1$e_load_total[[sc]] <- sime_load_total
+    df_replicates_pert1$e_load_abiot[[sc]] <- sime_load_abiot
+    df_replicates_pert1$e_load_biot[[sc]] <- sime_load_biot
+    df_replicates_pert1$e_load_network[[sc]] <- sime_load_network
+    
+    
+    
+    
+  }
+
+
+
+########################
+# PULL PERTURBATION
+########################
+
+
+
+if (simulate_perturbation2 == "yes") {
+    # Pulse Perturbation (Displacement in traits)
+    trait[1, ] <- trait[1, ] + rnorm(nsp, mean = 0, sd = 2)  # Apply a pulse perturbation
+    equilibrium_reached <- FALSE
+    # Initialize time-to-equilibrium tracker
+    time_to_equilibrium <- NA
+    
+    attempt <- 0 # attempts for finding an equilibrium
+    while (!equilibrium_reached && attempt < max_attempts) {
+      attempt <- attempt + 1
+      trait <- matrix(0, nrow=nsims, ncol=nsp)   ### store trait values in each timestep for each sp
+      z.change <- matrix(0, nrow=nsims, ncol=nsp)  ### store trait changes in each timestep for each sp
+      teta <- df_replicates$teta[[sc]] # teta from nonperturbed simulation
+      cummulative.matching.change <- matrix(0, nrow=n.host, ncol=n.exploiter)
+      stable_timesteps <- 0
+      for (sim in 1:(nsims - 1)) {
+        a.matrix <- create_a_matrix(trait_vec = trait[sim, ], Fmat = bigmat.F)
+        E <- ksi * (teta - trait[sim, ])
+        Rh <- calc_Rh_corrected(a_matrix = a.matrix, big_mat = bigmat.F, KSI.b = bio_sel_v, n_host = n.host, e_threshold = e)
+        Rp <- calc_Rp_corrected(a_matrix = a.matrix, big_mat = bigmat.F, KSI.b = bio_sel_e, B = b, n_host = n.host, n_exploiter = n.exploiter, nsp = nsp)
+        R <- c(Rh, Rp)
+        z.change[sim, ] <- her * (R + E)
+        trait[sim + 1, ] <- trait[sim, ] + z.change[sim, ]
+        
+        # Compute Trait evolution
+        R <- c(Rh, Rp) # Biotic selection for victims and exploiters
+        if( length(R) != length(E)) stop("something is wrong") #test R & E have same length 
+        z.change[sim,] <- her * (R + E) 
+        trait[sim+1,] <- trait[sim,] + z.change[sim,] 
+        
+        # Update a.matrix
+        dif.traits2 <- outer(trait[sim+1,], trait[sim+1,], FUN= "-") 
+        a.matrixsim2 <- bigmat.F*dif.traits2 
+        
+        # Calculate change in trait matching with time
+        matching.change.matrix <- a.matrixsim2[1:n.host, (n.host+1):nsp] -a.matrix[1:n.host, (n.host+1):nsp]
+        cummulative.matching.change <- cummulative.matching.change + abs(matching.change.matrix)
+        
+        # Check for equilibrium
+        if (sim >= max_stable_timesteps && isTRUE(all.equal(trait[sim, ], trait[sim - max_stable_timesteps + 1, ], tolerance = 1e-10))) {
+          stable_timesteps <- stable_timesteps + 1
+          if (stable_timesteps >= max_stable_timesteps) {
+            equilibrium_reached <- TRUE
+            time_to_equilibrium <- sim
+            message("Equilibrium reached after pulse perturbation at timestep ", sim)
+            df_replicates_pert2$traits_eq[[sc]] <- trait[sim, ]
+            break
+          }
+        } else {
+          stable_timesteps <- 0
+        }
+      }
+      if (!equilibrium_reached) message("Restarting pulse perturbation simulation: equilibrium not reached.")
+    }
+    
+    
+    if (!equilibrium_reached) {
+  message("perturbation 2 - Skipping to the next iteration after ", max_attempts, " attempts.")
+  next
+}
+    
+    
+    
+    
+    ################ store results
+    
+    
+    # save trait values at equilibrium
+    df_replicates_pert2$traits_eq_push2[[sc]] <- trait[sim,]
+    
+    
+    # Evolutionary rate
+    df_replicates_pert2$comm_evolr[[sc]] <- colSums(abs(z.change))/nsims
+    df_replicates_pert2$v_evolr[[sc]] <- colSums(abs(z.change[,1:n.host, drop=FALSE]))/nsims
+    df_replicates_pert2$e_evolr[[sc]]  <- colSums(abs(z.change[,(n.host+1):nsp, drop=FALSE]))/nsims
+    
+    
+    # mean fluctuation in trait matching
+    df_replicates_pert2$v_fcij[[sc]] <-rowSums(cummulative.matching.change)
+    df_replicates_pert2$e_fcij[[sc]] <- colSums(cummulative.matching.change)
+    df_replicates_pert2$comm_fcij[[sc]] <- c(rowSums(cummulative.matching.change), colSums(cummulative.matching.change))
+    
+    # fitness load
+    # --- Victims
+    simv_load_total <- numeric(length(n.host))
+    simv_load_abiot <- numeric(length(n.host))
+    simv_load_biot <- numeric(length(n.host))
+    
+    for (v in 1:n.host) {
+  # Filter partners by interaction matrix
+  interacting_exploiters <- which(binary.matrix[v, ] == 1)  # Get indices of interacting exploiters
+  x_partners <- trait[sim, n.host + interacting_exploiters]  # Traits of interacting exploiters
+  
+  fitness_load <- fitness_load_victims(
+    x_s = trait[sim, v],
+    x_0 = teta[v],
+    x_partners = x_partners,  # Only interacting exploiters
+    epsilon = e  # Pass interaction threshold
+  )
+  
+  simv_load_total[v] <- fitness_load$load
+  simv_load_abiot[v] <- fitness_load$abiotic_L
+  simv_load_biot[v] <- fitness_load$biotic_L
+}
+    
+    df_replicates_pert2$v_load_total[[sc]] <- simv_load_total
+    df_replicates_pert2$v_load_abiot[[sc]] <- simv_load_abiot
+    df_replicates_pert2$v_load_biot[[sc]] <- simv_load_biot
+    
+    # --- Exploiters
+    sime_load_total <- numeric(length(n.host))
+    sime_load_abiot <- numeric(length(n.host))
+    sime_load_biot <- numeric(length(n.host))
+    sime_load_network <- numeric(length(n.host))
+    index <- 1
+    
+    for (e in (n.host + 1):nsp) {
+      fitness_load <- fitness_load_exploiters(
+        x_s = trait[sim, e],
+        x_0 = teta[e],
+        x_partners = abs(a.matrix[, e])
+      )
+      
+      sime_load_total[index] <- fitness_load$load
+      sime_load_abiot[index] <- fitness_load$abiotic_L
+      sime_load_biot[index] <- fitness_load$biotic_L
+      sime_load_network[index] <- fitness_load$network_L
+      index <- index + 1
+    }
+    
+    df_replicates_pert2$e_load_total[[sc]] <- sime_load_total
+    df_replicates_pert2$e_load_abiot[[sc]] <- sime_load_abiot
+    df_replicates_pert2$e_load_biot[[sc]] <- sime_load_biot
+    df_replicates_pert2$e_load_network[[sc]] <- sime_load_network
+    
+    # time to equilibrium
+    df_replicates_pert2$time_to_equilibrium[[sc]] <- time_to_equilibrium
+    
+    
+}
+
+
+}
+
+df_replicates_backup <- df_replicates
+```
+
+
+
+
+
+#### Add network metrics to the output table
+
+```{r}
+
+df_replicates <- inner_join(df_replicates, df_network_metrics, by = "id_network")
+df_replicates_pert1 <- inner_join(df_replicates_pert1, df_network_metrics, by = "id_network")
+df_replicates_pert2 <- inner_join(df_replicates_pert2, df_network_metrics, by = "id_network")
+
+# save output
+
+# saveRDS(df_replicates, here::here("output/df_20replicates_22june2025_corrected.rds"))
+# saveRDS(df_replicates_pert1, here::here("output/df_20replicates_pert1_3jan_corrected.rds"))
+# saveRDS(df_replicates_pert2, here::here("output/df_20replicates_pert2_3jan_corrected.rds"))
+
+
+# load output
+
+# df_replicates <- readRDS(here::here("output/df_20replicates_3jan.rds"))
+# df_replicates_pert1 <- readRDS(here::here("output/df_20replicates_pert1_3jan.rds"))
+# df_replicates_pert2 <- readRDS(here::here("output/df_20replicates_pert2_3jan.rds"))
+
+```
+
+
+
+# Plots
+
+```{r}
+
+df_replicates <- df_replicates %>%
+  mutate(
+    
+    # evolutionary rate
+    mean_comm_evolr = map_dbl(comm_evolr, ~ mean(.x)),
+    mean_e_evolr = map_dbl(e_evolr, ~ mean(.x)),
+    mean_v_evolr = map_dbl(v_evolr, ~ mean(.x)),
+    
+    # trait matching fluctuation
+    mean_comm_fcij = map_dbl(comm_fcij, ~ mean(.x)),
+    mean_e_fcij = map_dbl(e_fcij, ~ mean(.x)),
+    mean_v_fcij = map_dbl(v_fcij, ~ mean(.x)),
+    
+    # fitness load
+    mean_comm_load_total = map_dbl(comm_load_total, ~ mean(.x)),
+    mean_comm_load_abiot = map_dbl(comm_load_abiot, ~ mean(.x)),
+    mean_comm_load_biot = map_dbl(comm_load_biot, ~ mean(.x)),
+    mean_comm_load_network = map_dbl(comm_load_network, ~ mean(.x)),
+    
+    mean_v_load_total = map_dbl(v_load_total, ~ mean(.x)),
+    mean_v_load_abiot = map_dbl(v_load_abiot, ~ mean(.x)),
+    mean_v_load_biot = map_dbl(v_load_biot, ~ mean(.x)),
+    mean_v_load_network = map_dbl(v_load_network, ~ mean(.x)),
+    
+    mean_e_load_total = map_dbl(e_load_total, ~ mean(.x)),
+    mean_e_load_abiot = map_dbl(e_load_abiot, ~ mean(.x)),
+    mean_e_load_biot = map_dbl(e_load_biot, ~ mean(.x)),
+    mean_e_load_network = map_dbl(e_load_network, ~ mean(.x))
+  )
+
+
+
+# df_replicates_pert1 <- df_replicates_pert1 %>%
+#   mutate(
+#     
+#     # evolutionary rate
+#     mean_comm_evolr = map_dbl(comm_evolr, ~ mean(.x)),
+#     mean_e_evolr = map_dbl(e_evolr, ~ mean(.x)),
+#     mean_v_evolr = map_dbl(v_evolr, ~ mean(.x)),
+#     
+#     # trait matching fluctuation
+#     mean_comm_fcij = map_dbl(comm_fcij, ~ mean(.x)),
+#     mean_e_fcij = map_dbl(e_fcij, ~ mean(.x)),
+#     mean_v_fcij = map_dbl(v_fcij, ~ mean(.x)),
+#     
+#     # fitness load
+#     mean_comm_load_total = map_dbl(comm_load_total, ~ mean(.x)),
+#     mean_comm_load_abiot = map_dbl(comm_load_abiot, ~ mean(.x)),
+#     mean_comm_load_biot = map_dbl(comm_load_biot, ~ mean(.x)),
+#     mean_comm_load_network = map_dbl(comm_load_network, ~ mean(.x)),
+#     
+#     mean_v_load_total = map_dbl(v_load_total, ~ mean(.x)),
+#     mean_v_load_abiot = map_dbl(v_load_abiot, ~ mean(.x)),
+#     mean_v_load_biot = map_dbl(v_load_biot, ~ mean(.x)),
+#     mean_v_load_network = map_dbl(v_load_network, ~ mean(.x)),
+#     
+#     mean_e_load_total = map_dbl(e_load_total, ~ mean(.x)),
+#     mean_e_load_abiot = map_dbl(e_load_abiot, ~ mean(.x)),
+#     mean_e_load_biot = map_dbl(e_load_biot, ~ mean(.x)),
+#     mean_e_load_network = map_dbl(e_load_network, ~ mean(.x))
+#   )
+# 
+# 
+# df_replicates_pert2 <- df_replicates_pert2 %>%
+#   mutate(
+#     
+#     # evolutionary rate
+#     mean_comm_evolr = map_dbl(comm_evolr, ~ mean(.x)),
+#     mean_e_evolr = map_dbl(e_evolr, ~ mean(.x)),
+#     mean_v_evolr = map_dbl(v_evolr, ~ mean(.x)),
+#     
+#     # trait matching fluctuation
+#     mean_comm_fcij = map_dbl(comm_fcij, ~ mean(.x)),
+#     mean_e_fcij = map_dbl(e_fcij, ~ mean(.x)),
+#     mean_v_fcij = map_dbl(v_fcij, ~ mean(.x)),
+#     
+#     # fitness load
+#     mean_comm_load_total = map_dbl(comm_load_total, ~ mean(.x)),
+#     mean_comm_load_abiot = map_dbl(comm_load_abiot, ~ mean(.x)),
+#     mean_comm_load_biot = map_dbl(comm_load_biot, ~ mean(.x)),
+#     mean_comm_load_network = map_dbl(comm_load_network, ~ mean(.x)),
+#     
+#     mean_v_load_total = map_dbl(v_load_total, ~ mean(.x)),
+#     mean_v_load_abiot = map_dbl(v_load_abiot, ~ mean(.x)),
+#     mean_v_load_biot = map_dbl(v_load_biot, ~ mean(.x)),
+#     mean_v_load_network = map_dbl(v_load_network, ~ mean(.x)),
+#     
+#     mean_e_load_total = map_dbl(e_load_total, ~ mean(.x)),
+#     mean_e_load_abiot = map_dbl(e_load_abiot, ~ mean(.x)),
+#     mean_e_load_biot = map_dbl(e_load_biot, ~ mean(.x)),
+#     mean_e_load_network = map_dbl(e_load_network, ~ mean(.x))
+#   )
+
+
+```
+
+
+## Spp-level measures
+
+```{r}
+
+
+
+df_e_spplevel <- data.frame(
+                            "betw_e" = unlist(df_replicates$betw_e),
+                            "degree_e" = unlist(df_replicates$degree_e),
+                            "e_evolr" = unlist(df_replicates$e_evolr),
+                            "e_fcij" = unlist(df_replicates$e_fcij),
+                            "e_load_total" = unlist(df_replicates$e_load_total),
+                            "e_load_biot" = unlist(df_replicates$e_load_biot),
+                            "e_load_abiot" = unlist(df_replicates$e_load_abiot),
+                            "e_load_network" = unlist(df_replicates$e_load_network))
+
+
+
+# df_e_spplevel_pert1 <- data.frame(
+#                             "betw_e" = unlist(df_replicates_pert1$betw_e),
+#                             "degree_e" = unlist(df_replicates_pert1$degree_e),
+#                             "e_evolr" = unlist(df_replicates_pert1$e_evolr),
+#                             "e_fcij" = unlist(df_replicates_pert1$e_fcij),
+#                             "e_load_total" = unlist(df_replicates_pert1$e_load_total),
+#                             "e_load_biot" = unlist(df_replicates_pert1$e_load_biot),
+#                             "e_load_abiot" = unlist(df_replicates_pert1$e_load_abiot))
+
+
+ 
+# df_e_spplevel_pert2 <- data.frame(
+#                             "betw_e" = unlist(df_replicates_pert2$betw_e),
+#                             "degree_e" = unlist(df_replicates_pert2$degree_e),
+#                             "e_evolr" = unlist(df_replicates_pert2$e_evolr),
+#                             "e_fcij" = unlist(df_replicates_pert2$e_fcij),
+#                             "e_load_total" = unlist(df_replicates_pert2$e_load_total),
+#                             "e_load_biot" = unlist(df_replicates_pert2$e_load_biot),
+#                             "e_load_abiot" = unlist(df_replicates_pert2$e_load_abiot),
+#                             "e_load_network" = unlist(df_replicates_pert2$e_load_network))
+
+
+
+
+
+df_v_spplevel <- data.frame(
+                            "betw_v" = unlist(df_replicates$betw_v),
+                            "degree_v" = unlist(df_replicates$degree_v),
+                            "v_evolr" = unlist(df_replicates$v_evolr),
+                            "v_fcij" = unlist(df_replicates$v_fcij),
+                            "v_load_total" = unlist(df_replicates$v_load_total),
+                            "v_load_biot" = unlist(df_replicates$v_load_biot),
+                            "v_load_abiot" = unlist(df_replicates$v_load_abiot))
+
+
+# df_v_spplevel_pert1 <- data.frame(
+#                             "betw_v" = unlist(df_replicates_pert1$betw_v),
+#                             "degree_v" = unlist(df_replicates_pert1$degree_v),
+#                             "v_evolr" = unlist(df_replicates_pert1$v_evolr),
+#                             "v_fcij" = unlist(df_replicates_pert1$v_fcij),
+#                             "v_load_total" = unlist(df_replicates_pert1$v_load_total),
+#                             "v_load_biot" = unlist(df_replicates_pert1$v_load_biot),
+#                             "v_load_abiot" = unlist(df_replicates_pert1$v_load_abiot))
+# 
+
+
+# df_v_spplevel_pert2 <- data.frame(
+#                             "betw_v" = unlist(df_replicates_pert2$betw_v),
+#                             "degree_v" = unlist(df_replicates_pert2$degree_v),
+#                             "v_evolr" = unlist(df_replicates_pert2$v_evolr),
+#                             "v_fcij" = unlist(df_replicates_pert2$v_fcij),
+#                             "v_load_total" = unlist(df_replicates_pert2$v_load_total),
+#                             "v_load_biot" = unlist(df_replicates_pert2$v_load_biot),
+#                             "v_load_abiot" = unlist(df_replicates_pert2$v_load_abiot))
+
+```
+
+
+
+# PLOTS
+
+Pars for plotting
+
+```{r}
+
+my_theme<-theme(axis.text=element_text(size=12),
+        axis.title = element_text(size = 14),
+        legend.text=element_text(size=10),
+        legend.title = element_text(size=12),
+        plot.title = element_text(face="bold",size=14,margin=margin(0,0,20,0),hjust = 0.5),
+        axis.title.y = element_text(hjust = 0.5),
+        axis.title.x = element_text(hjust = 0.5))
+
+
+back_transform_sqrt <- function(x) {
+  return(x^2)  # Square back the transformed value
+}
+
+
+back_transform_log <- function(x) {
+  return(exp(x))  # Exponentiate the log-transformed value
+}
+
+format_scientific <- function(x) {
+  ifelse(abs(x) < 0.001 | abs(x) > 10000,  # Use | for vectorized logical operation
+         sprintf("%.1e", x),  # Scientific notation with one decimal
+         round(x, 1))         # Otherwise, round to one decimal
+}
+
+
+
+```
+
+
+
+
+# Fig2
+
+
+## exploiters
+
+```{r}
+
+# Evolutonary rate
+
+
+df_plot <- df_replicates %>% 
+  select(id_network, replicate, complexity_index, modularity, NODF, mean_e_evolr, mean_e_fcij) %>%
+  group_by(id_network) %>%
+  summarize(mean_mean_e_evolr = mean(mean_e_evolr),
+            mean_mean_e_fcij = mean(mean_e_fcij),
+            complexity_index = complexity_index[1],
+            modularity = modularity[1],
+            NODF = NODF[1])
+
+# Compute breaks
+breaks <- quantile(df_plot$mean_mean_e_evolr, probs = c(0, 1), na.rm = TRUE)
+
+# Compute labels
+labels <- c("6.6e-6", "2.7e-2")
+
+
+
+plot_complIndex_evolrate <- ggplot(data = df_plot, aes(x = complexity_index, y = mean_mean_e_evolr)) +
+  geom_point(alpha = 0.3, size = 3, color = "#E69F00") +
+  labs(x = expression(sqrt(C * S)), y = expression(paste("Evolutionary rate ",italic((sigma))))) +
+  theme_classic()+
+  my_theme
+
+plot_modnest_evolrate <- ggplot(data = df_plot, aes(x = modularity, y = NODF)) +
+  geom_point(aes(color = mean_mean_e_evolr), alpha = 0.5, size = 4) +
+  labs(x = "Modularity", y = expression(paste("Nestedness ", italic(NODF)))) +
+  scale_color_viridis_c(
+    name = expression(italic(sigma)),
+    option = "turbo"
+  ) +
+  coord_cartesian(clip = "off") + 
+  theme_classic() +
+  theme(
+    legend.position = c(0.90, 0.85),
+    legend.justification = c("right", "top"),
+    legend.background = element_rect(fill = "white", color = "gray70"),
+    legend.key.size = unit(0.5, "cm"),
+    legend.title.align = 0.5
+  ) +
+  my_theme
+
+
+plot_degree_evolrate <- ggplot(data = df_e_spplevel, aes(x = degree_e, y = e_evolr)) +
+  geom_point(alpha = 0.03, color = "#E69F00") +
+  labs(x = "Species degree", y = expression(paste("Evolutionary rate ",italic((sigma))))) +
+  theme_classic()+
+  my_theme
+
+
+# Fluctuation in trait matching
+
+plot_complIndex_fc <- ggplot(data = df_plot, aes(x = complexity_index, y = sqrt(mean_mean_e_fcij))) +
+  geom_point(alpha = 0.3, size = 3, color = "#E69F00") +
+    scale_y_continuous(labels = back_transform_sqrt)+
+  labs(x = expression(sqrt(C * S)), y = expression(paste("Trait matching fluctuation ",(italic(lambda))))) +
+  theme_classic()+
+  my_theme
+
+# Define breaks and labels for the color scale
+breaks <- quantile(sqrt(df_plot$mean_mean_e_fcij), probs = c(0, 1))
+labels <- c(round(min(df_plot$mean_mean_e_fcij),1), round(max(df_plot$mean_mean_e_fcij), 1))
+
+plot_modnest_fc <- ggplot(data = df_plot, aes(x = modularity, y = NODF)) +
+  geom_point(aes(color = sqrt(mean_mean_e_fcij)), alpha = 0.5, size = 4) +
+  labs(x = "Modularity", y = expression(paste("Nestedness ", italic(NODF)))) +
+  scale_color_viridis_c(
+    name = expression(italic(lambda)),
+    option = "turbo"
+  ) +
+  coord_cartesian(clip = "off") + 
+  theme_classic() +
+  theme(
+    legend.position = c(0.90, 0.85),
+    legend.justification = c("right", "top"),
+    legend.background = element_rect(fill = "white", color = "gray70"),
+    legend.key.size = unit(0.5, "cm"),
+    legend.title.align = 0.5
+  ) +
+  my_theme
+
+
+
+plot_degree_fc <- ggplot(data = df_e_spplevel, aes(x = degree_e, y = sqrt(e_fcij))) +
+  geom_point(alpha = 0.03, color = "#E69F00") +
+  scale_y_continuous(labels = back_transform_sqrt)+
+  labs(x = "Species degree", y = expression(paste("Trait matching fluctuation ",(italic(lambda))))) +
+  theme_classic()+
+  my_theme
+
+
+```
+
+
+## victims
+
+```{r}
+
+# Evolutonary rate
+
+
+df_plot <- df_replicates %>% 
+  select(id_network, replicate, complexity_index, modularity, NODF, mean_v_evolr, mean_v_fcij) %>%
+  group_by(id_network) %>%
+  summarize(mean_mean_v_evolr = mean(mean_v_evolr),
+            mean_mean_v_fcij = mean(mean_v_fcij),
+            complexity_index = complexity_index[1],
+            modularity = modularity[1],
+            NODF = NODF[1])
+
+breaks <- quantile(df_plot$mean_mean_v_evolr, probs = c(0, 1))
+labels <- c(round(min(df_plot$mean_mean_v_evolr),1), round(max(df_plot$mean_mean_v_evolr), 1))
+
+plot_complIndex_evolrate_v <- ggplot(data = df_plot, aes(x = complexity_index, y = mean_mean_v_evolr)) +
+  geom_point(alpha = 0.3, size = 3, color = "#009E73") +
+  labs(x = expression(sqrt(C * S)), y = expression(paste("Evolutionary rate ",italic((sigma))))) +
+  theme_classic()+
+  my_theme
+
+plot_modnest_evolrate_v <- ggplot(data = df_plot, aes(x = modularity, y = NODF)) +
+  geom_point(aes(color = mean_mean_v_evolr), alpha = 0.5, size = 4) +
+  labs(x = "Modularity", y = expression(paste("Nestedness ", italic(NODF)))) +
+  scale_color_viridis_c(
+    name = expression(italic(sigma)),
+    option = "turbo"
+  ) +
+  coord_cartesian(clip = "off") +  
+  theme_classic() +
+  theme(
+    legend.position = c(0.90, 0.85),
+    legend.justification = c("right", "top"),
+    legend.background = element_rect(fill = "white", color = "gray70"),
+    legend.key.size = unit(0.5, "cm"),
+    legend.title.align = 0.5
+  ) +
+  my_theme
+
+
+
+plot_degree_evolrate_v <- ggplot(data = df_v_spplevel, aes(x = degree_v, y = v_evolr)) +
+  geom_point(alpha = 0.03, color = "#009E73") +
+  labs(x = "Species degree", y = expression(paste("Evolutionary rate ",italic((sigma))))) +
+  theme_classic()+
+  my_theme
+
+
+# Fluctuation in trait matching
+
+plot_complIndex_fc_v <- ggplot(data = df_plot, aes(x = complexity_index, y = sqrt(mean_mean_v_fcij))) +
+  geom_point(alpha = 0.3, size = 3, color = "#009E73") +
+  scale_y_continuous(labels = back_transform_sqrt)+
+  labs(x = expression(sqrt(C * S)), y = expression(paste("Trait matching fluctuation ",(italic(lambda))))) +
+  theme_classic()+
+  my_theme
+
+# Define breaks and labels for the color scale
+
+breaks <- quantile(sqrt(df_plot$mean_mean_v_fcij), probs = c(0, 1))
+labels <- c(round(min(df_plot$mean_mean_v_fcij),1), round(max(df_plot$mean_mean_v_fcij), 1))
+
+plot_modnest_fc_v <- ggplot(data = df_plot, aes(x = modularity, y = NODF)) +
+  geom_point(aes(color = sqrt(mean_mean_v_fcij)), alpha = 0.5, size = 4) +
+  labs(x = "Modularity", y = expression(paste("Nestedness ", italic(NODF)))) +
+  scale_color_viridis_c(
+    name = expression(italic(lambda)),
+    labels = back_transform_sqrt,
+    option = "turbo"
+  ) +
+  coord_cartesian(clip = "off") + 
+  theme_classic() +
+  theme(
+    legend.position = c(0.90, 0.85),
+    legend.justification = c("right", "top"),
+    legend.background = element_rect(fill = "white", color = "gray70"),
+    legend.key.size = unit(0.5, "cm"),
+    legend.title.align = 0.5
+  ) +
+  my_theme
+
+
+plot_degree_fc_v <- ggplot(data = df_v_spplevel, aes(x = degree_v, y = sqrt(v_fcij))) +
+  geom_point(alpha = 0.03, color = "#009E73") +
+  scale_y_continuous(labels = back_transform_sqrt)+
+  labs(x = "Species degree", y = expression(paste("Trait matching fluctuation ",(italic(lambda))))) +
+  theme_classic()+
+  my_theme
+
+
+```
+
+
+
+# Fig3
+
+
+```{r}
+fig_3_rate_e <- ggarrange(
+  plot_complIndex_evolrate, plot_modnest_evolrate, plot_degree_evolrate,
+  nrow = 1,
+  ncol = 3,
+  labels = LETTERS[1:3]
+)
+
+fig_3_rate_v <- ggarrange(
+  plot_complIndex_evolrate_v, plot_modnest_evolrate_v, plot_degree_evolrate_v,
+  nrow = 1,
+  ncol = 3,
+  labels = LETTERS[4:6]
+)
+
+
+fig_3_cf_e <- ggarrange(
+  plot_complIndex_fc, plot_modnest_fc, plot_degree_fc,
+  nrow = 1,
+  ncol = 3,
+  labels = LETTERS[7:9]
+)
+
+fig_3_cf_v <- ggarrange(
+  plot_complIndex_fc_v, plot_modnest_fc_v, plot_degree_fc_v,
+  nrow = 1,
+  ncol = 3,
+  labels = LETTERS[10:12]
+)
+
+
+
+fig_3 <- ggarrange(
+  
+  fig_3_rate_e,
+  fig_3_rate_v,
+  fig_3_cf_e,
+  fig_3_cf_v,
+  
+  nrow = 4,
+  ncol = 1
+)
+
+fig_3
+
+
+#ggsave(here::here("figures/fig_3_15Aug2025.png"), height = 16, width = 12)
+
+```
+
+
+
+
+
+# Fig4
+
+
+```{r}
+
+
+plot_adaptation_load_e <-  ggplot(data = df_e_spplevel, aes(x = e_load_abiot, y = sqrt(e_load_biot))) +  
+  geom_point(aes(color = sqrt(e_load_network)), alpha = 0.5, size = 3) + 
+  labs(x = expression(paste("Abiotic load ", italic((L[alpha])))), y = expression(paste("Biotic load ", italic((L[beta]))))) +
+  scale_y_continuous(labels = back_transform_sqrt)+
+  scale_color_viridis_c(name = expression(paste("Network load ", italic((L[gamma])))), labels = back_transform_sqrt, option = "turbo") +
+  theme_classic()+
+  theme(legend.position = "top",
+        legend.key.size = unit(0.5, "cm"))+
+  my_theme
+
+plot_adaptation_load_v <-  ggplot(data = df_v_spplevel, aes(x = v_load_abiot, y = sqrt(v_load_biot))) +  
+  geom_point(alpha = 0.5, size = 3) + 
+  labs(x = expression(paste("Abiotic load ", italic((L[alpha])))), y = expression(paste("biotic load ", italic((L[beta]))))) +
+  scale_y_continuous(labels = back_transform_sqrt)+
+  scale_color_viridis_c(name = expression(paste("Network load ", italic((L[gamma])))), labels = back_transform_sqrt, option = "turbo") +
+  theme_classic()+
+  theme(legend.position = "top",
+        legend.key.size = unit(0.5, "cm"))+
+  my_theme
+
+plot_load_components = ggarrange(
+  
+  plot_adaptation_load_e,
+  plot_adaptation_load_v,
+  
+  nrow = 2,
+  ncol = 1,
+  
+  common.legend = TRUE,
+  
+  legend = "right",
+  
+  labels = LETTERS[1:2]
+  
+)
+
+plot_load_components
+
+```
+
+
+```{r}
+df_plot_e <- df_replicates %>% 
+  select(id_network, replicate, complexity_index, modularity, NODF, mean_e_load_abiot, mean_e_load_biot, mean_e_load_network) %>%
+  group_by(id_network) %>%
+  summarize(mean_mean_e_load_abiot = mean(mean_e_load_abiot),
+            mean_mean_e_load_biot = mean(mean_e_load_biot),
+            mean_mean_e_load_network = mean(mean_e_load_network),
+            complexity_index = complexity_index[1],
+            modularity = modularity[1],
+            NODF = NODF[1])
+
+df_plot_v <- df_replicates %>% 
+  select(id_network, replicate, complexity_index, modularity, NODF, mean_v_load_abiot, mean_v_load_biot, mean_v_load_network) %>%
+  group_by(id_network) %>%
+  summarize(mean_mean_v_load_abiot = mean(mean_v_load_abiot),
+            mean_mean_v_load_biot = mean(mean_v_load_biot),
+            mean_mean_v_load_network = mean(mean_v_load_network),
+            complexity_index = complexity_index[1],
+            modularity = modularity[1],
+            NODF = NODF[1])
+```
+
+
+
+```{r}
+plot_biotic_complexity_exploiters <- ggplot(data = df_plot_e, aes(x = complexity_index, y = sqrt(mean_mean_e_load_biot))) +
+  geom_point(alpha = 0.5, size = 3, color = "#E69F00") +
+  scale_y_continuous(labels = back_transform_sqrt) +
+  labs(x = expression(sqrt(C * S)), y = expression(paste("Biotic load (", italic(L^{biotic}), ")"))) +
+  theme_classic() +
+  my_theme
+
+plot_network_complexity_exploiters <- ggplot(data = df_plot_e, aes(x = complexity_index, y = sqrt(mean_mean_e_load_network))) +
+  geom_point(alpha = 0.5, size = 3, color = "#E69F00") +
+  scale_y_continuous(labels = back_transform_sqrt) +
+  labs(x = expression(sqrt(C * S)), y = expression(paste("Network load (", italic(L^{network}), ")"))) +
+  theme_classic() +
+  my_theme
+
+plot_biotic_complexity_victims <- ggplot(data = df_plot_v, aes(x = complexity_index, y = sqrt(mean_mean_v_load_biot))) +
+  geom_point(alpha = 0.5, size = 3, color = "#009E73") +
+  scale_y_continuous(labels = back_transform_sqrt) +
+  labs(x = expression(sqrt(C * S)), y = expression(paste("Biotic load (", italic(L^{biotic}), ")"))) +
+  theme_classic() +
+  my_theme
+
+plot_biotic_centrality_exploiters <- ggplot(data = df_e_spplevel, aes(x = sqrt(degree_e), y = sqrt(e_load_biot))) +
+  geom_point(alpha = 0.1, size = 1, color = "#E69F00") +
+  scale_y_continuous(labels = back_transform_sqrt) +
+  scale_x_continuous(labels = back_transform_sqrt) +
+  labs(x = "Species degree", y = expression(paste("Biotic load (", italic(L^{biotic}), ")"))) +
+  theme_classic() +
+  my_theme
+
+plot_network_centrality_exploiters <- ggplot(data = df_e_spplevel, aes(x = sqrt(degree_e), y = sqrt(e_load_network))) +
+  geom_point(alpha = 0.1, size = 1, color = "#E69F00") +
+  scale_y_continuous(labels = back_transform_sqrt) +
+  scale_x_continuous(labels = back_transform_sqrt) +
+  labs(x = "Species degree", y = expression(paste("Network load (", italic(L^{network}), ")"))) +
+  theme_classic() +
+  my_theme
+
+plot_biotic_centrality_victims <- ggplot(data = df_v_spplevel, aes(x = sqrt(degree_v), y = sqrt(v_load_biot))) +
+  geom_point(alpha = 0.1, size = 1, color = "#009E73") +
+  scale_y_continuous(labels = back_transform_sqrt) +
+  scale_x_continuous(labels = back_transform_sqrt) +
+  labs(x = "Species degree", y = expression(paste("Biotic load (", italic(L^{biotic}), ")"))) +
+  theme_classic() +
+  my_theme
+
+
+
+
+```
+
+
+
+
+```{r}
+fig4 <- ggarrange(
+  plot_biotic_complexity_exploiters,
+  plot_network_complexity_exploiters,
+  plot_biotic_complexity_victims,
+  plot_biotic_centrality_exploiters,
+  plot_network_centrality_exploiters,
+  plot_biotic_centrality_victims,
+  ncol = 3,
+  nrow = 2,
+  labels = LETTERS[1:6]
+)
+
+fig4
+
+#ggsave("../figures/fig_4_15Aug2025.png", height = 9, width = 12)
+```

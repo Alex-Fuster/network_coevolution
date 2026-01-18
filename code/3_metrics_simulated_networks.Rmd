@@ -1,0 +1,366 @@
+---
+title: "Simulate networks and compute metrics"
+---
+
+
+This script generates a set of simulated victim-exploiter bipartite networks designed to isolate the effect of single structural properties. The dataset of simulated networks it produces is then used in **4_simulation_simulated_networks.Rmd**.
+
+It first loads empirical network metrics to define realistic baseline values (mean numbers of victims/exploiters and mean connectance), then builds a simulation design table where each row corresponds to one target manipulation: (i) varying total species richness while keeping the victim:exploiter ratio and connectance fixed, (ii) varying connectance while keeping richness fixed, (iii) varying "nestedness control" parameters while holding richness and baseline connectance constant, and (iv) comparing different degree-distribution templates (random, scale-free, nested) under matched baseline conditions. 
+
+For each design row, it generates a binary interaction matrix using custom network generators, removes isolated species, converts the matrix to an igraph bipartite object, and then computes key network metrics (realized connectance, modularity, and NODF nestedness). It also computes a species-level "biotic effects evenness" measure by applying Shannon entropy to the row-wise total-effects matrix (from the indirect-effects calculation), and stores victim and exploiter degree vectors for downstream analyses. All outputs (matrices, metrics, and vectors) are stored in the simulation dataframe and saved.
+
+
+```{r}
+library(bipartite)
+library(igraph)
+library(tidyr)
+
+# Custom functions
+
+source(here::here("code/functions/generate_network.R"))
+source(here::here("code/functions/compute_net_effects.R"))
+source(here::here("code/functions/compute_metrics_networks.R"))
+
+```
+
+
+Obtain mean number of victims, exploiters, and connectance from empirical networks
+
+```{r}
+df_empirical_nets <- readRDS(here::here("output/df_network_metrics.rds"))
+
+df_empirical_nets <- df_empirical_nets[-which(df_empirical_nets$nestedness == 0),]
+
+mean_v <- round(mean(df_empirical_nets$nvictim),0)
+mean_e <- round(mean(df_empirical_nets$nexpl), 0)
+mean_c <- round(mean(df_empirical_nets$connectance), 2)
+range_mod <- range(df_empirical_nets$modularity)
+range_nest <- range(df_empirical_nets$nestedness)
+
+```
+
+```{r}
+
+#### Richness
+
+# Define parameters
+total_individuals <- seq(from = 12, to = 120, by = 2)
+
+# Calculate victim and exploiter numbers
+victim_numbers <- round(total_individuals * (mean_v / (mean_v + mean_e)))
+exploiter_numbers <- total_individuals - victim_numbers
+
+df <- data.frame("test_metric" = rep("richness", length(total_individuals)),
+                 "n" = total_individuals, 
+                 "n_v" = victim_numbers, 
+                 "n_e" = exploiter_numbers,
+                 "connectance" = rep(mean_c, length(total_individuals)),
+         "modularity" = numeric(length(total_individuals)),
+         "nestedness" = numeric(length(total_individuals)),
+         "NODF" = numeric(length(total_individuals)),
+         "distribution" = character(length(total_individuals))) 
+
+
+
+#### Connectance
+
+connectance = seq(from = 0.05, to = 0.9, by = 0.01)
+
+df_conn <- data.frame("test_metric" = rep("connectance", length(connectance)),
+                 "n" = rep((mean_v+mean_e),length(connectance)),
+                 "n_v" = rep(mean_v, length(connectance)),
+                 "n_e" = rep(mean_e, length(connectance)),
+                 "connectance" = connectance,
+                 "modularity" = numeric(length(connectance)),
+                 "nestedness" = numeric(length(connectance)),
+                 "NODF" = numeric(length(connectance)),
+                 "distribution" = character(length(connectance))) 
+
+
+# values of nestedness = 15 keep the connectance around 0.3
+
+
+#### Nestedness/modularity/connectance
+
+nestedness = seq(from = 1, to = 29, by = 0.5)
+
+df_nest <- data.frame("test_metric" = rep("nestedness", length(nestedness)),
+                 "n" = rep((mean_v+mean_e),length(nestedness)),
+                 "n_v" = rep(mean_v, length(nestedness)),
+                 "n_e" = rep(mean_e, length(nestedness)),
+                 "connectance" = numeric(length(nestedness)),
+                 "modularity" = numeric(length(nestedness)),
+                 "nestedness" = nestedness,
+                 "NODF" = numeric(length(nestedness)),
+                 "distribution" = character(length(nestedness))) 
+
+
+distribution = rep(c("random", "scale-free", "nested"), 100)
+
+
+df_distrib <- data.frame("test_metric" = rep("distribution", length(distribution)),
+                 "n" = rep((mean_v+mean_e),length(distribution)),
+                 "n_v" = rep(mean_v, length(distribution)),
+                 "n_e" = rep(mean_e, length(distribution)),
+                 "connectance" = rep(mean_c, length(distribution)),
+                 "modularity" = numeric(length(distribution)),
+                 "nestedness" = numeric(length(distribution)),
+                 "NODF" = numeric(length(distribution)),
+                 "distribution" = distribution) 
+
+
+df_simulation <- rbind(df, df_conn, df_nest, df_distrib)
+df_simulation$evenness = vector("list", nrow(df_simulation))
+df_simulation$degree_e = vector("list", nrow(df_simulation))
+df_simulation$degree_v = vector("list", nrow(df_simulation))
+
+```
+
+
+
+For scale distributions, both random and scale-free have the connectance of mean_conn. For nested, we set nestedness at 12 which produces networks with connectances around 0.3 (mean_conn).
+
+
+## compute matrices without isolated species
+
+```{r}
+df_simulation$binmat = vector("list", nrow(df_simulation)) #original matrix computed by the functions
+
+df_simulation$binmat2 <- vector("list", nrow(df_simulation)) # tweaked matrix to add at least one connection to isolated species
+```
+
+
+
+```{r}
+
+# function to compute connectance
+
+compute_connectance <- function(g) {
+  # Ensure the graph is bipartite
+  if (!is_bipartite(g)) {
+    stop("The graph is not bipartite. Ensure 'type' attribute is correctly set.")
+  }
+  
+  # Extract node types
+  type <- V(g)$type
+  
+  # Number of species at each level
+  T <- sum(type)       # Number of nodes in the top level (TRUE in 'type')
+  B <- sum(!type)      # Number of nodes in the bottom level (FALSE in 'type')
+  
+  # Number of observed edges (L)
+  L <- ecount(g)       # Total number of edges in the bipartite graph
+  
+  # Maximum possible interactions (m)
+  m <- T * B           # Product of species in the two levels
+  
+  print(paste("T =", T, "B =", B, "L =", L, "m =", m))
+  if (m == 0 || is.na(m)) {
+    stop("Invalid maximum possible interactions (m).")
+  }
+  
+  # Connectance formula
+  connectance <- L / m
+  return(connectance)
+}
+
+compute_modularity <- function(g) {
+  # Compute modularity using different methods
+  mod_louvain <- cluster_louvain(g)$modularity
+  mod_walktrap <- modularity(cluster_walktrap(g))
+  mod_fast_greedy <- modularity(cluster_fast_greedy(g))
+  mod_leading_eigen <- cluster_leading_eigen(g)$modularity
+  
+  # Compute the mean modularity
+  mean_modularity <- mean(c(mod_louvain, mod_walktrap, mod_fast_greedy, mod_leading_eigen), na.rm = TRUE)
+  
+  return(mean_modularity)
+}
+```
+
+
+
+
+```{r}
+
+for (i in 1:nrow(df_simulation)) {
+  
+  print(paste(sprintf("iteration %s", i), "of", nrow(df_simulation)))
+  
+  
+  if(df_simulation[i, "test_metric"] == "richness"){
+    
+    result = generate_distrib(connectance = mean_c, 
+                              n1 = df_simulation[i, "n_v"], 
+                              n2 = df_simulation[i, "n_e"], 
+                              distribution_type = "random", 
+                              nestedness = 1, 
+                              modularity = 0)
+    
+    mat = generate.BEDD(result[[1]], result[[2]])
+    
+    df_simulation$binmat[[i]] = mat
+    
+    mat = remove_isolated_species(mat)
+    df_simulation$binmat2[[i]] = mat
+    
+    
+    # Convert matrix to igraph object
+    g <- graph_from_biadjacency_matrix(mat)
+    
+    
+    df_simulation[i, "NODF"] = nestednodf(mat)$statistic["NODF"]
+    df_simulation[i, "connectance"] = compute_connectance(g)
+    df_simulation[i, "modularity"] = compute_modularity(g)
+    df_simulation[[i, "evenness"]] = apply(compute_total_effects(mat),1,compute_shannon)
+    df_simulation[[i, "degree_e"]] <- compute_centrality(binmatrix = mat, n_v = nrow(mat), n_e = ncol(mat))$degree[(nrow(mat)+1):(nrow(mat) + ncol(mat))]
+    df_simulation[[i, "degree_v"]] <- compute_centrality(binmatrix = mat, n_v = nrow(mat), n_e = ncol(mat))$degree[1:nrow(mat)]
+    
+    
+    
+    
+  }else if(df_simulation[i, "test_metric"] == "connectance"){
+    
+    
+    
+    result = generate_distrib(connectance = df_simulation[i, "connectance"], 
+                              n1 = mean_v, 
+                              n2 = mean_e, 
+                              distribution_type = "random", 
+                              nestedness = 1, 
+                              modularity = 0)
+    
+    mat = generate.BEDD(result[[1]], result[[2]])
+    
+    df_simulation$binmat[[i]] = mat
+    mat = remove_isolated_species(mat)
+    df_simulation$binmat2[[i]] = mat
+    
+    # Convert matrix to igraph object
+    g <- mat_to_igraph(mat)
+    
+    df_simulation[i, "NODF"] = nestednodf(mat)$statistic["NODF"]
+    df_simulation[i, "connectance"] = compute_connectance(g)
+    df_simulation[i, "modularity"] = compute_modularity(g)
+    df_simulation[[i, "evenness"]] = apply(compute_total_effects(mat),1, compute_shannon)
+    #  df_simulation[i, "entropy"] = compute_SVD_entropy(mat)
+    df_simulation[[i, "degree_e"]] <- compute_centrality(binmatrix = mat, n_v = nrow(mat), n_e = ncol(mat))$degree[(nrow(mat)+1):(nrow(mat) + ncol(mat))]
+    df_simulation[[i, "degree_v"]] <- compute_centrality(binmatrix = mat, n_v = nrow(mat), n_e = ncol(mat))$degree[1:nrow(mat)]
+    
+    
+    
+    
+    
+  }else if(df_simulation[i, "test_metric"] == "nestedness"){
+    
+    
+    
+    result = generate_distrib(connectance = mean_c, 
+                              n1 = mean_v, 
+                              n2 = mean_e, 
+                              distribution_type = "nested", 
+                              nestedness = df_simulation[i, "nestedness"], 
+                              modularity = 0)
+    
+    mat = generate.BEDD(result[[1]], result[[2]])
+    
+    df_simulation$binmat[[i]] = mat
+    mat = remove_isolated_species(mat)
+    df_simulation$binmat2[[i]] = mat
+    
+    
+    
+    # Convert matrix to igraph object
+    g <- graph_from_biadjacency_matrix(mat)
+    
+    df_simulation[i, "NODF"] = nestednodf(mat)$statistic["NODF"]
+    df_simulation[i, "modularity"] = compute_modularity(g)
+    df_simulation[i, "connectance"] = compute_connectance(g)
+    df_simulation[[i, "evenness"]] = apply(compute_total_effects(mat),1, compute_shannon)
+    #    df_simulation[i, "entropy"] = compute_SVD_entropy(mat)
+    df_simulation[[i, "degree_e"]] <- compute_centrality(binmatrix = mat, n_v = nrow(mat), n_e = ncol(mat))$degree[(nrow(mat)+1):(nrow(mat) + ncol(mat))]
+    df_simulation[[i, "degree_v"]] <- compute_centrality(binmatrix = mat, n_v = nrow(mat), n_e = ncol(mat))$degree[1:nrow(mat)]
+    
+    
+    
+    
+    
+  }else if(df_simulation[i, "test_metric"] == "distribution" & 
+           df_simulation[i, "distribution"] == "random" |
+           df_simulation[i, "test_metric"] == "distribution" & 
+           df_simulation[i, "distribution"] == "scale-free"){
+    
+    
+    
+    result = generate_distrib(connectance = mean_c, 
+                              n1 = mean_v, 
+                              n2 = mean_e, 
+                              distribution_type = df_simulation[i, "distribution"], 
+                              nestedness = 1, 
+                              modularity = 0)
+    
+    mat = generate.BEDD(result[[1]], result[[2]])
+    
+    df_simulation$binmat[[i]] = mat
+    mat = remove_isolated_species(mat)
+    df_simulation$binmat2[[i]] = mat
+    
+    
+    
+    # Convert matrix to igraph object
+    g <- graph_from_biadjacency_matrix(mat)
+    
+    df_simulation[i, "NODF"] = nestednodf(mat)$statistic["NODF"]
+    df_simulation[i, "connectance"] = compute_connectance(g)
+    df_simulation[i, "modularity"] = compute_modularity(g)
+    df_simulation[[i, "evenness"]] = apply(compute_total_effects(mat), 1, compute_shannon)
+    df_simulation[[i, "degree_e"]] <- compute_centrality(binmatrix = mat, n_v = nrow(mat), n_e = ncol(mat))$degree[(nrow(mat)+1):(nrow(mat) + ncol(mat))]
+    df_simulation[[i, "degree_v"]] <- compute_centrality(binmatrix = mat, n_v = nrow(mat), n_e = ncol(mat))$degree[1:nrow(mat)]
+    
+    
+    
+    
+    
+    
+    
+    
+  }else if(df_simulation[i, "test_metric"] == "distribution" & 
+           df_simulation[i, "distribution"] == "nested"){
+    
+    
+    
+    result = generate_distrib(connectance = mean_c, 
+                              n1 = mean_v, 
+                              n2 = mean_e, 
+                              distribution_type = df_simulation[i, "distribution"], 
+                              nestedness = 12, 
+                              modularity = 0)
+    
+    mat = generate.BEDD(result[[1]], result[[2]])
+    
+    df_simulation$binmat[[i]] = mat
+    mat = remove_isolated_species(mat)
+    df_simulation$binmat2[[i]] = mat
+    
+    
+    # Convert matrix to igraph object
+    g <- graph_from_biadjacency_matrix(mat)
+    
+    df_simulation[i, "NODF"] = nestednodf(mat)$statistic["NODF"]
+    df_simulation[i, "connectance"] = compute_connectance(g)
+    df_simulation[i, "modularity"] = compute_modularity(g)
+    df_simulation[[i, "evenness"]] = apply(compute_total_effects(mat),1, compute_shannon)
+    df_simulation[[i, "degree_e"]] <- compute_centrality(binmatrix = mat, n_v = nrow(mat), n_e = ncol(mat))$degree[(nrow(mat)+1):(nrow(mat) + ncol(mat))]
+    df_simulation[[i, "degree_v"]] <- compute_centrality(binmatrix = mat, n_v = nrow(mat), n_e = ncol(mat))$degree[1:nrow(mat)]
+  }
+  
+  
+}
+
+
+head(df_simulation)
+
+#saveRDS(df_simulation, "../output/df_metrics_simulated_nets.rds")
+
+```
+

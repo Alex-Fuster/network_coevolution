@@ -1,0 +1,379 @@
+---
+title: "Demonstration: compute total effects on species in a network"
+---
+
+This script is a demonstration of how we compute the net or total effects of interactions (direct + indirect) on each species of a network, and the mean and sd of the community.
+
+
+
+```{r}
+library(bipartite)
+library(igraph)
+library(reshape2)
+library(tidyverse)
+library(ggplot2)
+library(ggpubr)
+```
+
+
+
+Functions to generate a network given connectance, where all species have at least one interaction (just a way to generate random networks):
+
+```{r}
+# function to generate probabilities of interaction based on trait matching
+
+generate_prob_matrix_each_sim <- function(n.host, n.exploiter, trait_vec, scale = 0.1) {
+  
+  nsp = n.host + n.exploiter
+  dif.traits <- outer(trait_vec, trait_vec, FUN= "-")
+  
+  # Create trait matching matrix
+  
+  matching_matrix<-dif.traits[(n.exploiter+1):nsp, 1:n.exploiter]
+  
+  # compute probabilities based on trait matching
+  
+  prob_matching<-exp(-(matching_matrix/scale)^2)
+  
+  return (prob_matching)
+  
+}
+
+
+
+# Function to generate network given connectance
+
+
+generate_network_given_conn_each_sim_allsp.int <- function(n_exploiter, n_host, conn, trait_sim) {
+  
+  prob_matrix<-generate_prob_matrix_each_sim(n.host = n_host, n.exploiter = n_exploiter, trait_vec = trait_sim)
+  
+  #n_ones <- round(n_exploiter*n_host*conn)
+  
+  q_prob_int<- quantile(prob_matrix, prob = 1 - conn)
+  index<-which(prob_matrix > q_prob_int, arr.ind = TRUE)
+  L <- matrix(0, nr = n_host, nc = n_exploiter)
+  L[index] <-1
+  
+  # Add one interaction to exploiters with no interactions
+  
+  expl_no_int<-colSums(L)
+  vec_e_no_int<-which(expl_no_int == 0)
+  
+  for (i in vec_e_no_int) {
+    v_toeat <- which.max(prob_matrix[,i])
+    L[v_toeat,i] <- 1
+  }
+  
+  
+  # Add one interaction to hosts with no interactions
+  
+  host_no_int<-rowSums(L)
+  vec_h_no_int<-which(host_no_int == 0)
+  
+  for (i in vec_h_no_int) {
+    e_predating <- which.max(prob_matrix[i,])
+    L[i,e_predating] <- 1
+  }
+  
+  return(L)
+  
+}
+
+
+# compute F matrix from binary matrix
+
+create_F <- function(binmat) {
+  
+  mat_F<-rbind (
+    cbind( matrix(0, nrow=nrow(binmat), ncol=nrow(binmat)),binmat),
+    cbind( t(binmat), matrix(0, nrow=ncol(binmat),ncol=ncol(binmat)))) 
+  return(mat_F)
+}
+
+```
+
+
+
+Functions to compute the total effects (direct and indirect) that species experience in a network:
+
+```{r}
+
+compute_total_effects <- function(int_matrix) {
+  
+  f_mat <- create_F(int_matrix)
+  
+  # generating a matrix that all rows sum to one. In this matrix the element describes the proportional effect of a species in the column on the species in the row
+  
+  P = f_mat
+  
+  for (i in 1:nrow(f_mat)) {
+    P[i,] <- P[i,] / sum(P[i,])
+  }
+  
+  #weighting each row for the total contribution of interactions for a given process (e.g., the amount of selection imposed by mutualistic partners on the mean trait of a given species
+  
+  m=0.6 # m is the strength and needs to be between zero and one
+  Q=m*P 
+  
+  #Note: you can change m for a diagonal matrix if you want m to be species specific
+  
+  #computing the matrix of total effects (direct and indirect)
+  
+  I <- diag(nrow(f_mat)) #identity matrix
+  T <- solve(I - Q)  #compute the inverse of I-Q
+  
+  return(T)
+  
+}
+
+```
+
+
+Function to calculate Shannon Index for a row (i.e. total effects that each species receives):
+
+
+```{r}
+calculate_shannon <- function(row) {
+  
+  eps <- 1e-10  # Small constant to avoid taking the logarithm of zero
+  row_proportions <- row / sum(row)
+  row_proportions[row_proportions == 0] <- eps  # Replace zeros with eps
+  shannon_index <- -sum(row_proportions * log2(row_proportions))
+  normalized_shannon <- shannon_index / log2(length(row))
+  return(normalized_shannon)
+}
+
+```
+
+
+
+Function to compute total effects on each species, mean and sd total effects of a network, and save objects (binary matrix, T matrix, vector of effects, network plot):
+
+```{r}
+
+# Function to compute the mean total effects that species experience in a network
+
+
+compute_df_effects <- function(n.exploiter, n.host, conn, seed, id) {
+  
+  label <- id
+  set.seed(seed)
+  
+  # create network
+  
+  nsp <- n.exploiter + n.host
+  vec_traits <- rnorm(nsp, mean=0, sd=0.1)
+  
+  binary.matrix <- generate_network_given_conn_each_sim_allsp.int (
+    n_exploiter = n.exploiter, n_host = n.host, 
+    conn = conn,
+    trait_sim = vec_traits)
+  
+  # record network properties
+  
+  size <- nsp
+  c <- networklevel(binary.matrix, index = "connectance")
+  mod <- networklevel(binary.matrix, index = "modularity")
+  NODF <- networklevel(binary.matrix, index = "NODF")
+  
+  # compute T
+  
+  T_binary.matrix <- compute_total_effects(binary.matrix)
+  T_mean <- mean(T_binary.matrix)
+  
+  # compute mean and sd spp T inn (received effects)
+  
+  ### Calculate normalized Shannon Index for each row
+  normalized_shannon_values <- numeric(nrow(T_binary.matrix))
+  
+  for (i in 1:nrow(T_binary.matrix)) {
+    normalized_shannon_values[i] <- calculate_shannon(T_binary.matrix[i, ])
+  }
+  
+  T_inn_vec <- normalized_shannon_values
+  mean_T_spp_inn <- mean(normalized_shannon_values)
+  sd_T_spp_inn <- sd(normalized_shannon_values)
+  
+  # compute mean and sd spp T out
+  
+  T_out_vec <- colSums(T_binary.matrix)
+  mean_T_spp_out <- mean(colSums(T_binary.matrix))
+  sd_T_spp_out <- sd(colSums(T_binary.matrix))
+  
+  # PLOT - network and total effects received by each node
+  
+  # create graph object
+  
+  graph <- graph_from_incidence_matrix(binary.matrix, weighted = NULL, directed = FALSE)
+  
+  # compute degree
+  
+  d_vec <- degree(graph)
+  
+  V(graph)$degree <- d_vec
+  V(graph)$normalized_shannon_values <- normalized_shannon_values
+  
+  df <- data.frame(
+    
+    label,
+    size,
+    c,
+    mod,
+    NODF,
+    
+    T_mean,
+    
+    mean_T_spp_inn,
+    sd_T_spp_inn,
+    
+    mean_T_spp_out,
+    sd_T_spp_out
+    
+    )
+  
+  
+  l_graph <- list()
+  l_graph[[1]] <- graph
+  df$graph <- l_graph
+  
+  l_vec_traits <- list()
+  l_vec_traits[[1]] <- graph
+  df$vec_traits <- l_vec_traits
+  
+  l_T_binary.matrix <- list()
+  l_T_binary.matrix[[1]] <- T_binary.matrix
+  df$T_binary.matrix <- l_T_binary.matrix
+  
+  l_binary.matrix <- list()
+  l_binary.matrix[[1]] <- binary.matrix
+  df$binary.matrix <- l_binary.matrix
+  
+  l_T_inn_vec <- list()
+  l_T_inn_vec[[1]] <- T_inn_vec
+  df$T_inn_vec <- l_T_inn_vec
+  
+  l_T_out_vec <- list()
+  l_T_out_vec[[1]] <- T_out_vec
+  df$T_out_vec <- l_T_out_vec
+  
+  return(df)
+  
+}
+
+
+```
+
+
+
+Compute the total effects for networks varying in size and connectance
+
+```{r}
+
+df_effects_A <- compute_df_effects(n.exploiter = 8, 
+                   n.host = 8, 
+                   conn = 0.2, 
+                   seed = 100, 
+                   id = "A")
+
+df_effects_B <- compute_df_effects(n.exploiter = 25, 
+                   n.host = 25, 
+                   conn = 0.2, 
+                   seed = 100, 
+                   id = "B")
+
+df_effects <- rbind(df_effects_A, df_effects_B)
+
+df_effects
+```
+
+
+
+# Plots - T matrix
+
+Function to plot T matrix as heatmap
+
+```{r}
+
+plot_heatmap <- function(T_matrix, nsp) {
+  
+
+# the matrix needs names
+dat <- T_matrix
+rownames(dat) <- 1:nsp
+colnames(dat) <- 1:nsp
+
+## convert to tibble, add row identifier, and shape "long"
+
+dat2 <- dat %>%
+  as_tibble() %>%
+  rownames_to_column("Var1") %>%
+  pivot_longer(-Var1, names_to = "Var2", values_to = "value") %>%
+  mutate(
+    Var1 = factor(Var1, levels = 1:nsp),
+    Var2 = factor(gsub("V", "", Var2), levels = 1:nsp)
+  )
+
+
+plot <- ggplot(dat2, aes(Var1, Var2)) +
+  geom_tile(aes(fill = value)) +
+ # geom_text(aes(label = round(value, 1))) +
+  scale_fill_gradient(low = "white", high = "red")+
+  theme_classic()
+
+return(plot)
+  
+}
+
+```
+
+
+*Plot T matrices as heatmaps*
+
+```{r}
+
+p_heatmap_a <- plot_heatmap(df_effects_A$T_binary.matrix[[1]], nsp = 16)
+p_heatmap_b <- plot_heatmap(df_effects_B$T_binary.matrix[[1]], nsp = 50)
+
+ggarrange(p_heatmap_a,
+          p_heatmap_b,
+          labels = c("A", "B"))
+
+```
+
+
+*Plots - network and total effects on each spp*
+
+Lighter colors indicates higher values.
+
+```{r}
+
+# Define a color scale based on the range of normalized_shannon_values
+color_scale <- heat.colors(100)
+
+graph <- df_effects_A$graph[[1]]
+
+plot(
+  graph,
+  vertex.size = V(graph)$degree * 6,
+  vertex.color = color_scale[cut(V(graph)$normalized_shannon_values, breaks = 100)],
+  layout = layout_as_bipartite,
+  vertex.label = NA,
+  main = "A"
+)
+
+graph <- df_effects_B$graph[[1]]
+
+plot(
+  graph,
+  vertex.size = V(graph)$degree * 2,
+  vertex.color = color_scale[cut(V(graph)$normalized_shannon_values, breaks = 100)],
+  layout = layout_as_bipartite,
+  vertex.label = NA,
+  main = "B"
+)
+
+```
+
+
+
