@@ -1,4 +1,4 @@
-# Trapped in the Web: Network Architectures Spread Coevolution and Shape Adaptation
+# Trapped in the web: network architectures spread coevolution and shape adaptation
 
 ## Authors
 
